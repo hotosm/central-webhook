@@ -52,7 +52,11 @@ func SetupWebhook(
 	}
 
 	// init the trigger function
-	db.CreateTrigger(ctx, dbPool, "audits")
+	db.CreateTrigger(ctx, dbPool, "audits", db.TriggerOptions{
+		UpdateEntityURL:     &updateEntityUrl,
+		NewSubmissionURL:    &newSubmissionUrl,
+		ReviewSubmissionURL: &reviewSubmissionUrl,
+	})
 
 	// setup the notifier
 	notifier := db.NewNotifier(log, listener)

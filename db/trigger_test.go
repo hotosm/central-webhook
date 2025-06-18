@@ -110,7 +110,10 @@ func TestEntityTrigger(t *testing.T) {
 	is.NoErr(err)
 
 	// Create audit trigger
-	err = CreateTrigger(ctx, pool, "audits_test")
+	updateEntityUrl := "https://test.com"
+	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+		UpdateEntityURL:     &updateEntityUrl,
+	})
 	is.NoErr(err)
 
 	// Create listener
@@ -230,7 +233,10 @@ func TestNewSubmissionTrigger(t *testing.T) {
 	is.NoErr(err)
 
 	// Create audit trigger
-	err = CreateTrigger(ctx, pool, "audits_test")
+	newSubmissionUrl := "https://test.com"
+	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+		NewSubmissionURL:    &newSubmissionUrl,
+	})
 	is.NoErr(err)
 
 	// Create listener
@@ -349,7 +355,10 @@ func TestNewSubmissionTrigger_TruncatesLargePayload(t *testing.T) {
 	is.NoErr(err)
 
 	// Create audit trigger
-	err = CreateTrigger(ctx, pool, "audits_test")
+	newSubmissionUrl := "https://test.com"
+	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+		NewSubmissionURL:    &newSubmissionUrl,
+	})
 	is.NoErr(err)
 
 	// Create listener
@@ -452,7 +461,10 @@ func TestReviewSubmissionTrigger(t *testing.T) {
 	is.NoErr(err)
 
 	// Create audit trigger
-	err = CreateTrigger(ctx, pool, "audits_test")
+	reviewSubmissionUrl := "https://test.com"
+	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+		ReviewSubmissionURL:    &reviewSubmissionUrl,
+	})
 	is.NoErr(err)
 
 	// Create listener
@@ -548,7 +560,10 @@ func TestNoTrigger(t *testing.T) {
 	createAuditTestsTable(ctx, conn, is)
 
 	// Create audit trigger
-	err = CreateTrigger(ctx, pool, "audits_test")
+	newSubmissionUrl := "https://test.com"
+	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+		NewSubmissionURL:    &newSubmissionUrl,
+	})
 	is.NoErr(err)
 
 	// Create listener
@@ -598,4 +613,56 @@ func TestNoTrigger(t *testing.T) {
 	cancel()
 	sub.Unlisten(ctx) // uses background ctx anyway
 	listener.Close(ctx)
+}
+
+// Test that only the related CASE statements are added to the SQL function
+func TestModularSql(t *testing.T) {
+	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
+	if len(dbUri) == 0 {
+		// Default
+		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
+	}
+
+	is := is.New(t)
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	pool, err := InitPool(ctx, log, dbUri)
+	is.NoErr(err)
+
+	// Get connection and defer close
+	conn, err := pool.Acquire(ctx)
+	is.NoErr(err)
+	defer conn.Release()
+
+	// Create audits_test table
+	createAuditTestsTable(ctx, conn, is)
+
+	// Create audit trigger
+	updateEntityUrl := "https://test.com"
+	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+		UpdateEntityURL:    &updateEntityUrl,
+	})
+	is.NoErr(err)
+
+	// Verify the function only contains the entity.update.version CASE
+	var functionSQL string
+	row := conn.QueryRow(ctx, `
+		SELECT pg_get_functiondef(p.oid)
+		FROM pg_proc p
+		JOIN pg_namespace n ON p.pronamespace = n.oid
+		WHERE p.proname = 'new_audit_log' AND n.nspname = 'public'
+	`)
+	err = row.Scan(&functionSQL)
+	is.NoErr(err)
+
+	// Check that the expected CASE branch is present
+	is.True(strings.Contains(functionSQL, "WHEN 'entity.update.version'"))
+	// Ensure that other cases are not present
+	is.True(!strings.Contains(functionSQL, "WHEN 'submission.create'"))
+	is.True(!strings.Contains(functionSQL, "WHEN 'submission.update'"))
+
+	// Cleanup
+	conn.Exec(ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
+	cancel()
 }
