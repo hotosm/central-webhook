@@ -7,10 +7,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type TriggerOptions struct {
+	UpdateEntityURL     *string
+	NewSubmissionURL    *string
+	ReviewSubmissionURL *string
+}
+
 // Example parsed JSON
 // {"action":"entity.update.version","actorId":1,"details":{"entityDefId":1001,...},"dml_action":"INSERT"}}
 
-func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string) error {
+func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, opts TriggerOptions) error {
 	// This trigger runs on the `audits` table by default, and creates a new event
 	// in the odk-events queue when a new event is created in the table
 
@@ -19,8 +25,79 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string) 
 		tableName = "audits"
 	}
 
-	// SQL for creating the function
-	createFunctionSQL := `
+	// Create SQL trigger function dynamically, based on params
+	caseStatements := ""
+
+	if opts.UpdateEntityURL != nil {
+		caseStatements += `
+			WHEN 'entity.update.version' THEN
+				SELECT entity_defs.data
+				INTO result_data
+				FROM entity_defs
+				WHERE entity_defs.id = (NEW.details->>'entityDefId')::int;
+
+				js := jsonb_set(js, '{data}', result_data, true);
+
+				IF length(js::text) > 8000 THEN
+					RAISE NOTICE 'Payload too large, truncating: %', left(js::text, 500) || '...';
+					js := jsonb_set(js, '{truncated}', 'true'::jsonb, true);
+					js := jsonb_set(js, '{data}', '"Payload too large. Truncated."'::jsonb, true);
+				END IF;
+
+				PERFORM pg_notify('odk-events', js::text);
+		`
+	}
+
+	if opts.NewSubmissionURL != nil {
+		caseStatements += `
+			WHEN 'submission.create' THEN
+				SELECT jsonb_build_object('xml', submission_defs.xml)
+				INTO result_data
+				FROM submission_defs
+				WHERE submission_defs.id = (NEW.details->>'submissionDefId')::int;
+
+				js := jsonb_set(js, '{data}', result_data, true);
+
+				IF length(js::text) > 8000 THEN
+					RAISE NOTICE 'Payload too large, truncating: %', left(js::text, 500) || '...';
+					js := jsonb_set(js, '{truncated}', 'true'::jsonb, true);
+					js := jsonb_set(js, '{data}', '"Payload too large. Truncated."'::jsonb, true);
+				END IF;
+
+				PERFORM pg_notify('odk-events', js::text);
+		`
+	}
+
+	if opts.ReviewSubmissionURL != nil {
+		caseStatements += `
+			WHEN 'submission.update' THEN
+				SELECT jsonb_build_object('instanceId', submission_defs."instanceId")
+				INTO result_data
+				FROM submission_defs
+				WHERE submission_defs.id = (NEW.details->>'submissionDefId')::int;
+
+				js := jsonb_set(js, '{data}', jsonb_build_object('reviewState', js->'details'->>'reviewState'), true);
+				js := jsonb_set(js, '{details}', (js->'details')::jsonb - 'reviewState', true);
+				js := jsonb_set(js, '{details}', (js->'details') || result_data, true);
+
+				IF length(js::text) > 8000 THEN
+					RAISE NOTICE 'Payload too large, truncating: %', left(js::text, 500) || '...';
+					js := jsonb_set(js, '{truncated}', 'true'::jsonb, true);
+					js := jsonb_set(js, '{data}', '"Payload too large. Truncated."'::jsonb, true);
+				END IF;
+
+				PERFORM pg_notify('odk-events', js::text);
+		`
+	}
+
+	// default ELSE case (always included)
+	caseStatements += `
+		ELSE
+			RETURN NEW;
+	`
+
+	// full function SQL
+	createFunctionSQL := fmt.Sprintf(`
 		CREATE OR REPLACE FUNCTION new_audit_log() RETURNS trigger AS
 		$$
 		DECLARE
@@ -28,89 +105,18 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string) 
 			action_type text;
 			result_data jsonb;
 		BEGIN
-			-- Serialize the NEW row into JSONB
 			SELECT to_jsonb(NEW.*) INTO js;
-
-			-- Add the DML action (INSERT/UPDATE)
 			js := jsonb_set(js, '{dml_action}', to_jsonb(TG_OP));
-
-			-- Extract the action type from the NEW row
 			action_type := NEW.action;
 
-			-- Handle different action types with a CASE statement
 			CASE action_type
-				WHEN 'entity.update.version' THEN
-					SELECT entity_defs.data
-					INTO result_data
-					FROM entity_defs
-					WHERE entity_defs.id = (NEW.details->>'entityDefId')::int;
-
-					-- Merge the entity details into the JSON data key
-					js := jsonb_set(js, '{data}', result_data, true);
-
-					-- Truncate if payload is too large: https://github.com/hotosm/central-webhook/issues/8
-					IF length(js::text) > 8000 THEN
-						RAISE NOTICE 'Payload too large, truncating: %', left(js::text, 500) || '...';
-						js := jsonb_set(js, '{truncated}', 'true'::jsonb, true);
-						js := jsonb_set(js, '{data}', '"Payload too large. Truncated."'::jsonb, true);
-					END IF;
-
-					-- Notify the odk-events queue
-					PERFORM pg_notify('odk-events', js::text);
-
-				WHEN 'submission.create' THEN
-					SELECT jsonb_build_object('xml', submission_defs.xml)
-					INTO result_data
-					FROM submission_defs
-					WHERE submission_defs.id = (NEW.details->>'submissionDefId')::int;
-
-					-- Merge the submission XML into the JSON data key
-					js := jsonb_set(js, '{data}', result_data, true);
-
-					-- Truncate if payload is too large: https://github.com/hotosm/central-webhook/issues/8
-					IF length(js::text) > 8000 THEN
-						RAISE NOTICE 'Payload too large, truncating: %', left(js::text, 500) || '...';
-						js := jsonb_set(js, '{truncated}', 'true'::jsonb, true);
-						js := jsonb_set(js, '{data}', '"Payload too large. Truncated."'::jsonb, true);
-					END IF;
-
-					-- Notify the odk-events queue
-					PERFORM pg_notify('odk-events', js::text);
-
-				WHEN 'submission.update' THEN
-					SELECT jsonb_build_object('instanceId', submission_defs."instanceId")
-					INTO result_data
-					FROM submission_defs
-					WHERE submission_defs.id = (NEW.details->>'submissionDefId')::int;
-
-					-- Extract 'reviewState' from 'details' and set it in 'data'
-					js := jsonb_set(js, '{data}', jsonb_build_object('reviewState', js->'details'->>'reviewState'), true);
-
-					-- Remove 'reviewState' from 'details'
-					js := jsonb_set(js, '{details}', (js->'details')::jsonb - 'reviewState', true);
-
-					-- Merge the instanceId into the existing 'details' key in JSON
-					js := jsonb_set(js, '{details}', (js->'details') || result_data, true);
-
-					-- Truncate if payload is too large: https://github.com/hotosm/central-webhook/issues/8
-					IF length(js::text) > 8000 THEN
-						RAISE NOTICE 'Payload too large, truncating: %', left(js::text, 500) || '...';
-						js := jsonb_set(js, '{truncated}', 'true'::jsonb, true);
-						js := jsonb_set(js, '{data}', '"Payload too large. Truncated."'::jsonb, true);
-					END IF;
-
-					-- Notify the odk-events queue
-					PERFORM pg_notify('odk-events', js::text);
-
-				ELSE
-					-- Skip pg_notify for unsupported actions & insert as normal
-					RETURN NEW;
+			%s
 			END CASE;
 
 			RETURN NEW;
 		END;
 		$$ LANGUAGE 'plpgsql';
-	`
+	`, caseStatements)
 
 	// SQL for dropping the existing trigger
 	dropTriggerSQL := fmt.Sprintf(`
