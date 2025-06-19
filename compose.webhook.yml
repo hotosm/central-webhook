@@ -4,7 +4,7 @@
 
 services:
   webhook:
-    image: "ghcr.io/hotosm/central-webhook:0.1.1"
+    image: "ghcr.io/hotosm/central-webhook:0.2.0"
     environment:
       CENTRAL_WEBHOOK_DB_URI: postgresql://odk:odk@postgres14:5432/odk?sslmode=disable
       CENTRAL_WEBHOOK_UPDATE_ENTITY_URL: ${CENTRAL_WEBHOOK_UPDATE_ENTITY_URL}
