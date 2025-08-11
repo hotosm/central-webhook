@@ -88,6 +88,15 @@ func SetupWebhook(
 
 				// Only send the request for correctly parsed (supported) events
 				if parsedData != nil {
+
+					if parsedData.HttpSent {
+						// This event was already sent via HTTP, just log for monitoring
+						log.Info("event was already sent via HTTP",
+							"eventType", parsedData.Type,
+							"truncated", parsedData.Truncated)
+						continue
+					}
+
 					if parsedData.Type == "entity.update.version" && updateEntityUrl != "" {
 						webhook.SendRequest(log, ctx, updateEntityUrl, *parsedData, apiKey)
 					} else if parsedData.Type == "submission.create" && newSubmissionUrl != "" {

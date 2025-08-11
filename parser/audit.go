@@ -40,6 +40,11 @@ type OdkAuditLog struct {
 	ActorID int         `json:"actorId"`
 	Details interface{} `json:"details"` // Use an interface to handle different detail types
 	Data    interface{} `json:"data"`    // Use an interface to handle different data types
+
+	// New fields for http extension
+	HttpSent  bool   `json:"http_sent"`  // Indicates whether it has already been sent via HTTP
+	Truncated bool   `json:"truncated"`  // Indicates whether the payload was truncated
+	DmlAction string `json:"dml_action"` // INSERT, UPDATE, DELETE
 }
 
 // ProcessedEvent represents the final parsed event structure (to send to the webhook API)
@@ -47,6 +52,10 @@ type ProcessedEvent struct {
 	Type string      `json:"type"` // The event type, entity update or new submission
 	ID   string      `json:"id"`   // Entity UUID or Submission InstanceID
 	Data interface{} `json:"data"` // The actual entity data or wrapped submission XML
+
+	// New fields for http extension
+	HttpSent  bool `json:"http_sent"`
+	Truncated bool `json:"truncated"` // Used for monitoring in main
 }
 
 // ParseJsonString converts the pg_notify string to OdkAuditLog
@@ -74,6 +83,17 @@ func ParseEventJson(log *slog.Logger, ctx context.Context, data []byte) (*Proces
 
 	// Prepare the result structure
 	var processedEvent ProcessedEvent
+
+	// Hybrid fields to notify from HTTP_POST
+	processedEvent.HttpSent = rawLog.HttpSent
+	processedEvent.Truncated = rawLog.Truncated
+
+	// If this event was already sent via HTTP, it need basic info for monitoring
+	if rawLog.HttpSent {
+		processedEvent.Type = rawLog.Action
+		log.Debug("processing monitoring event (already sent via HTTP)", "action", rawLog.Action)
+		return &processedEvent, nil
+	}
 
 	// Parse the details field based on the action
 	switch rawLog.Action {

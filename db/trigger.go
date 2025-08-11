@@ -48,8 +48,12 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		`
 	}
 
+	// You need insstall the http extension for this to work
+	// For ubuntu "sudo apt install postgresql-17-http" / Replace 17 with your version of PostgreSQL
+	// Documentation: https://github.com/pramsey/pgsql-http
+	// Then, you need to run "CREATE EXTENSION IF NOT EXISTS http";
 	if opts.NewSubmissionURL != nil {
-		caseStatements += `
+		caseStatements += fmt.Sprintf(`
 			WHEN 'submission.create' THEN
 				SELECT jsonb_build_object('xml', submission_defs.xml)
 				INTO result_data
@@ -58,14 +62,16 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 
 				js := jsonb_set(js, '{data}', result_data, true);
 
-				IF length(js::text) > 8000 THEN
-					RAISE NOTICE 'Payload too large, truncating: %', left(js::text, 500) || '...';
-					js := jsonb_set(js, '{truncated}', 'true'::jsonb, true);
-					js := jsonb_set(js, '{data}', '"Payload too large. Truncated."'::jsonb, true);
-				END IF;
+				PERFORM http_set_curlopt('CURLOPT_TIMEOUT', '40');
+				PERFORM http_set_curlopt('CURLOPT_CONNECTTIMEOUT', '1');
+
+				PERFORM http_post('%s', js::text, 'application/json');
+				
+				js := jsonb_set(js, '{http_sent}', 'true'::jsonb, true);
+				js := jsonb_set(js, '{data}', '"Sent via HTTP"'::jsonb, true);
 
 				PERFORM pg_notify('odk-events', js::text);
-		`
+		`, *opts.NewSubmissionURL)
 	}
 
 	if opts.ReviewSubmissionURL != nil {
@@ -105,9 +111,15 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 			action_type text;
 			result_data jsonb;
 		BEGIN
+			action_type := NEW.action;
+
+			IF (action_type = 'submission.create' AND TG_OP != 'INSERT') OR
+			(action_type IN ('entity.update.version', 'submission.update') AND TG_OP NOT IN ('INSERT', 'UPDATE')) THEN
+				RETURN NEW;
+			END IF;
+
 			SELECT to_jsonb(NEW.*) INTO js;
 			js := jsonb_set(js, '{dml_action}', to_jsonb(TG_OP));
-			action_type := NEW.action;
 
 			CASE action_type
 			%s
