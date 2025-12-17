@@ -1,0 +1,24 @@
+name: 🐘 Build & Publish PostgreSQL with HTTP Extension
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'http.dockerfile'
+      - '.github/workflows/http-postgres.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write  # or GHCR push
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        pg_version: [14, 15, 16, 17, 18]
+    uses: hotosm/gh-workflows/.github/workflows/image_build.yml@2.0.5
+    with:
+      build_target: pg-${{ matrix.pg_version }}
+      image_name: "ghcr.io/hotosm/postgres:${{ matrix.pg_version }}-http"
+      dockerfile: http.dockerfile
