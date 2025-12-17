@@ -20,5 +20,6 @@ jobs:
     uses: hotosm/gh-workflows/.github/workflows/image_build.yml@2.0.5
     with:
       build_target: pg-${{ matrix.pg_version }}
-      image_name: "ghcr.io/hotosm/postgres:${{ matrix.pg_version }}-http"
+      image_tags: |
+        "ghcr.io/hotosm/postgres:${{ matrix.pg_version }}-http"
       dockerfile: http.dockerfile
