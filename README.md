@@ -28,18 +28,20 @@ The `centralwebhook` tool is a simple CLI that installs or uninstalls database t
 ## Prerequisites
 
 - ODK Central running, connecting to an accessible PostgreSQL database.
+- A POST webhook endpoint on your service API, to call when the selected event occurs.
 - The `pgsql-http` extension installed and enabled in your PostgreSQL database:
+
   ```sql
   CREATE EXTENSION http;
   ```
-  > [!NOTE]
-  > **Using our helper images**: We provide PostgreSQL images with the `pgsql-http` extension pre-installed:
-  > - `ghcr.io/hotosm/postgres:18-http` (based on vanilla PostgreSQL 18 images)
-  >
-  > These images are drop-in replacements for standard PostgreSQL images and simply add the extension.
-  >
-  > **Installing manually**: If you don't wish to use these images, you must install the `pgsql-http` extension yourself. The extension may require superuser privileges to install. If you cannot install it yourself, ask your database administrator.
-- A POST webhook endpoint on your service API, to call when the selected event occurs.
+
+> [!NOTE]
+> **Using our helper images**: We provide PostgreSQL images with the `pgsql-http` extension pre-installed:
+> - `ghcr.io/hotosm/postgres:18-http` (based on vanilla PostgreSQL 18 images)
+>
+> These images are drop-in replacements for standard PostgreSQL images and simply add the extension.
+>
+> **Installing manually**: If you don't wish to use these images, you must install the `pgsql-http` extension yourself. The extension may require superuser privileges to install. If you cannot install it yourself, ask your database administrator.
 
 ## Usage
 
