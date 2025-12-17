@@ -1,5 +1,3 @@
-// Wrapper for the main tool functionality
-
 package main
 
 import (
@@ -8,16 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hotosm/central-webhook/db"
-	"github.com/hotosm/central-webhook/parser"
-	"github.com/hotosm/central-webhook/webhook"
 )
 
 func getDefaultLogger(lvl slog.Level) *slog.Logger {
@@ -37,115 +29,6 @@ func getDefaultLogger(lvl slog.Level) *slog.Logger {
 	}))
 }
 
-func SetupWebhook(
-	log *slog.Logger,
-	ctx context.Context,
-	dbPool *pgxpool.Pool,
-	apiKey *string, // use a pointer so it's possible to pass 'nil;
-	updateEntityUrl, newSubmissionUrl, reviewSubmissionUrl string,
-) error {
-	// setup the listener
-	listener := db.NewListener(dbPool)
-	if err := listener.Connect(ctx); err != nil {
-		log.Error("error setting up listener: %v", "error", err)
-		return err
-	}
-
-	// init the trigger function
-	db.CreateTrigger(ctx, dbPool, "audits", db.TriggerOptions{
-		UpdateEntityURL:     &updateEntityUrl,
-		NewSubmissionURL:    &newSubmissionUrl,
-		ReviewSubmissionURL: &reviewSubmissionUrl,
-	})
-
-	// setup the notifier
-	notifier := db.NewNotifier(log, listener)
-	go notifier.Run(ctx)
-
-	// subscribe to the 'odk-events' channel
-	log.Info("listening to odk-events channel")
-	sub := notifier.Listen("odk-events")
-
-	// indefinitely listen for updates
-	go func() {
-		<-sub.EstablishedC()
-		for {
-			select {
-			case <-ctx.Done():
-				sub.Unlisten(ctx)
-				log.Info("done listening for notifications")
-				return
-
-			case data := <-sub.NotificationC():
-				eventData := string(data)
-				log.Debug("got notification", "data", eventData)
-
-				parsedData, err := parser.ParseEventJson(log, ctx, []byte(eventData))
-				if err != nil {
-					log.Error("failed to parse notification", "error", err)
-					continue // Skip processing this notification
-				}
-
-				// Only send the request for correctly parsed (supported) events
-				if parsedData != nil {
-					if parsedData.Type == "entity.update.version" && updateEntityUrl != "" {
-						webhook.SendRequest(log, ctx, updateEntityUrl, *parsedData, apiKey)
-					} else if parsedData.Type == "submission.create" && newSubmissionUrl != "" {
-						webhook.SendRequest(log, ctx, newSubmissionUrl, *parsedData, apiKey)
-					} else if parsedData.Type == "submission.update" && reviewSubmissionUrl != "" {
-						webhook.SendRequest(log, ctx, reviewSubmissionUrl, *parsedData, apiKey)
-					} else {
-						log.Debug(
-							fmt.Sprintf(
-								"%s event type was triggered, but no webhook url was provided",
-								parsedData.Type,
-							),
-							"eventType",
-							parsedData.Type,
-						)
-					}
-				}
-			}
-		}
-	}()
-
-	// unsubscribe after 60s
-	// go func() {
-	// 	time.Sleep(3 * time.Second)
-	// 	sub.Unlisten(ctx)
-	// }()
-
-	stopCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Listen for termination signals (e.g., SIGINT/SIGTERM)
-	go func() {
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-		<-c
-		log.Info("received shutdown signal")
-		cancel()
-	}()
-
-	<-stopCtx.Done()
-	log.Info("application shutting down")
-
-	return nil
-}
-
-func printStartupMsg() {
-	banner := `
-   _____           _             _  __          __  _     _                 _    
-  / ____|         | |           | | \ \        / / | |   | |               | |   
- | |     ___ _ __ | |_ _ __ __ _| |  \ \  /\  / /__| |__ | |__   ___   ___ | | __
- | |    / _ \ '_ \| __| '__/ _' | |   \ \/  \/ / _ \ '_ \| '_ \ / _ \ / _ \| |/ /
- | |___|  __/ | | | |_| | | (_| | |    \  /\  /  __/ |_) | | | | (_) | (_) |   < 
-  \_____\___|_| |_|\__|_|  \__,_|_|     \/  \/ \___|_.__/|_| |_|\___/ \___/|_|\_\
-	`
-	fmt.Println(banner)
-	fmt.Println("")
-}
-
 func main() {
 	ctx := context.Background()
 
@@ -157,9 +40,11 @@ func main() {
 	defaultApiKey := os.Getenv("CENTRAL_WEBHOOK_API_KEY")
 	defaultLogLevel := os.Getenv("CENTRAL_WEBHOOK_LOG_LEVEL")
 
+	// Database connection
 	var dbUri string
-	flag.StringVar(&dbUri, "db", defaultDbUri, "DB host (postgresql://{user}:{password}@{hostname}/{db}?sslmode=disable)")
+	flag.StringVar(&dbUri, "db", defaultDbUri, "DB URI (postgresql://{user}:{password}@{hostname}/{db}?sslmode=disable)")
 
+	// Webhook URLs
 	var updateEntityUrl string
 	flag.StringVar(&updateEntityUrl, "updateEntityUrl", defaultUpdateEntityUrl, "Webhook URL for update entity events")
 
@@ -169,13 +54,55 @@ func main() {
 	var reviewSubmissionUrl string
 	flag.StringVar(&reviewSubmissionUrl, "reviewSubmissionUrl", defaultReviewSubmissionUrl, "Webhook URL for review submission events")
 
+	// API Key
 	var apiKey string
-	flag.StringVar(&apiKey, "apiKey", defaultApiKey, "X-API-Key header value, for autenticating with webhook API")
+	flag.StringVar(&apiKey, "apiKey", defaultApiKey, "X-API-Key header value for authenticating with webhook API")
 
+	// Logging
 	var debug bool
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
 
-	flag.Parse()
+	// Check if first argument is a command (allows flags after command)
+	var command string
+	if len(os.Args) > 1 {
+		firstArg := os.Args[1]
+		if firstArg == "install" || firstArg == "uninstall" {
+			command = firstArg
+			// Temporarily remove command from os.Args so flag.Parse() can parse remaining flags
+			originalArgs := os.Args
+			os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+			flag.Parse()
+			os.Args = originalArgs // Restore for potential future use
+		} else {
+			// Command not first, parse flags normally
+			flag.Parse()
+			args := flag.Args()
+			if len(args) == 0 {
+				fmt.Fprintf(os.Stderr, "Error: command is required. Use 'install' or 'uninstall'\n")
+				fmt.Fprintf(os.Stderr, "Usage: %s <command> [flags] or %s [flags] <command>\n", os.Args[0], os.Args[0])
+				flag.PrintDefaults()
+				os.Exit(1)
+			}
+			command = args[0]
+		}
+	} else {
+		// No arguments at all
+		flag.Parse()
+		args := flag.Args()
+		if len(args) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: command is required. Use 'install' or 'uninstall'\n")
+			fmt.Fprintf(os.Stderr, "Usage: %s <command> [flags] or %s [flags] <command>\n", os.Args[0], os.Args[0])
+			flag.PrintDefaults()
+			os.Exit(1)
+		}
+		command = args[0]
+	}
+
+	// Validate command
+	if command != "install" && command != "uninstall" {
+		fmt.Fprintf(os.Stderr, "Error: command must be either 'install' or 'uninstall', got: %s\n", command)
+		os.Exit(1)
+	}
 
 	// Set logging level
 	var logLevel slog.Level
@@ -188,29 +115,74 @@ func main() {
 	}
 	log := getDefaultLogger(logLevel)
 
+	// Validate database URI
 	if dbUri == "" {
-		fmt.Fprintf(os.Stderr, "DB URI is required\n")
+		fmt.Fprintf(os.Stderr, "Error: DB URI is required\n")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	if updateEntityUrl == "" && newSubmissionUrl == "" && reviewSubmissionUrl == "" {
-		fmt.Fprintf(os.Stderr, "At least one of updateEntityUrl, newSubmissionUrl, reviewSubmissionUrl is required\n")
-		flag.PrintDefaults()
-		os.Exit(1)
+	// For install command, validate at least one webhook URL is provided
+	if command == "install" {
+		if updateEntityUrl == "" && newSubmissionUrl == "" && reviewSubmissionUrl == "" {
+			fmt.Fprintf(os.Stderr, "Error: At least one webhook URL is required for install command\n")
+			fmt.Fprintf(os.Stderr, "  Provide at least one of: -updateEntityUrl, -newSubmissionUrl, -reviewSubmissionUrl\n")
+			flag.PrintDefaults()
+			os.Exit(1)
+		}
 	}
 
 	// Get a connection pool
 	dbPool, err := db.InitPool(ctx, log, dbUri)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "could not connect to database: %v", err)
+		fmt.Fprintf(os.Stderr, "Error: could not connect to database: %v\n", err)
 		os.Exit(1)
 	}
+	defer dbPool.Close()
 
-	printStartupMsg()
-	err = SetupWebhook(log, ctx, dbPool, &apiKey, updateEntityUrl, newSubmissionUrl, reviewSubmissionUrl)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error setting up webhook: %v", err)
-		os.Exit(1)
+	// Execute command
+	switch command {
+	case "install":
+		var apiKeyPtr *string
+		if apiKey != "" {
+			apiKeyPtr = &apiKey
+		}
+
+		var updateEntityUrlPtr *string
+		if updateEntityUrl != "" {
+			updateEntityUrlPtr = &updateEntityUrl
+		}
+
+		var newSubmissionUrlPtr *string
+		if newSubmissionUrl != "" {
+			newSubmissionUrlPtr = &newSubmissionUrl
+		}
+
+		var reviewSubmissionUrlPtr *string
+		if reviewSubmissionUrl != "" {
+			reviewSubmissionUrlPtr = &reviewSubmissionUrl
+		}
+
+		log.Info("Installing webhook triggers")
+		err = db.CreateTrigger(ctx, dbPool, "audits", db.TriggerOptions{
+			UpdateEntityURL:     updateEntityUrlPtr,
+			NewSubmissionURL:    newSubmissionUrlPtr,
+			ReviewSubmissionURL: reviewSubmissionUrlPtr,
+			APIKey:              apiKeyPtr,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to install triggers: %v\n", err)
+			os.Exit(1)
+		}
+		log.Info("Webhook triggers installed successfully")
+
+	case "uninstall":
+		log.Info("Uninstalling webhook triggers")
+		err = db.RemoveTrigger(ctx, dbPool, "audits")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to uninstall triggers: %v\n", err)
+			os.Exit(1)
+		}
+		log.Info("Webhook triggers uninstalled successfully")
 	}
 }

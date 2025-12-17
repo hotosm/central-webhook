@@ -16,3 +16,6 @@ services:
       postgres14:
         condition: service_started
     restart: always
+
+  postgres14:
+    image: "ghcr.io/hotosm/postgres:14-http"
