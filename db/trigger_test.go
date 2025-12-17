@@ -37,17 +37,21 @@ func createTestServer(handler http.Handler) (*testServer, error) {
 		return nil, err
 	}
 
-	server := &http.Server{Handler: handler}
+	server := &http.Server{
+		Handler: handler,
+	}
 
 	port := listener.Addr().(*net.TCPAddr).Port
 
-	// Use Docker service name so Postgres container can resolve it
-	hostname := os.Getenv("TEST_SERVER_HOST")
-	if hostname == "" {
+	// Try container hostname first for CI, but fallback to compose service
+	// name for local runs
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
 		hostname = "webhook" // docker-compose service name
 	}
 
 	url := fmt.Sprintf("http://%s:%d", hostname, port)
+
 
 	ts := &testServer{
 		server:   server,
