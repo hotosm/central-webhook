@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'http.dockerfile'
+      - 'pgsql-http.dockerfile'
       - '.github/workflows/http-postgres.yml'
   workflow_dispatch:
 
@@ -22,4 +22,4 @@ jobs:
       build_target: pg-${{ matrix.pg_version }}
       image_tags: |
         "ghcr.io/hotosm/postgres:${{ matrix.pg_version }}-http"
-      dockerfile: http.dockerfile
+      dockerfile: pgsql-http.dockerfile

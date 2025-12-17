@@ -17,8 +17,6 @@ services:
       - ./main.go:/app/main.go:ro
       - ./main_test.go:/app/main_test.go:ro
       - ./db:/app/db:ro
-      - ./webhook:/app/webhook:ro
-      - ./parser:/app/parser:ro
     # environment:
       # # Override to use database on host
       # CENTRAL_WEBHOOK_DB_URI: postgresql://odk:odk@host.docker.internal:5434/odk?sslmode=disable
@@ -36,7 +34,10 @@ services:
     entrypoint: go test -timeout=2m -v ./...
 
   db:
-    image: "postgis/postgis:17-3.5-alpine"
+    image: "ghcr.io/hotosm/postgres:18-http"
+    build:
+      dockerfile: pgsql-http.dockerfile
+      target: pg-18
     container_name: centralwebhook-db
     environment:
       - POSTGRES_USER=odk

@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable -->
 <p align="center">
-  <em>A lightweight webhook for ODK Central submissions and entity property updates.</em>
+  <em>A lightweight CLI tool for installing webhook triggers in ODK Central database.</em>
 </p>
 <p align="center">
   <a href="https://github.com/hotosm/central-webhook/actions/workflows/release.yml" target="_blank">
@@ -17,75 +17,63 @@
 
 <!-- markdownlint-enable -->
 
-Call a remote API on ODK Central database events:
+Install PostgreSQL triggers that automatically call remote APIs on ODK Central database events:
 
 - New submission (XML).
 - Update entity (entity properties).
 - Submission review (approved, hasIssues, rejected).
 
-The `centralwebhook` binary is small ~15MB and only consumes
-~5MB of memory when running.
-
-> [!NOTE]
-> There is a 8000 byte Postgres limit for the submission XML that can be sent
-> until [this issue](https://github.com/hotosm/central-webhook/issues/9)
-> is addressed.
->
-> The submission XML will simply be truncated in this case.
+The `centralwebhook` tool is a simple CLI that installs or uninstalls database triggers. Once installed, the triggers use the `pgsql-http` extension to send HTTP requests directly from the database.
 
 ## Prerequisites
 
-- ODK Central running, connecting to an accessible Postgresql database.
-- A POST webhook endpoint on your service API, to call when the selected
-  event occurs.
+- ODK Central running, connecting to an accessible PostgreSQL database.
+- The `pgsql-http` extension installed and enabled in your PostgreSQL database:
+  ```sql
+  CREATE EXTENSION http;
+  ```
+  > [!NOTE]
+  > **Using our helper images**: We provide PostgreSQL images with the `pgsql-http` extension pre-installed:
+  > - `ghcr.io/hotosm/postgres:18-http` (based on vanilla PostgreSQL 18 images)
+  >
+  > These images are drop-in replacements for standard PostgreSQL images and simply add the extension.
+  >
+  > **Installing manually**: If you don't wish to use these images, you must install the `pgsql-http` extension yourself. The extension may require superuser privileges to install. If you cannot install it yourself, ask your database administrator.
+- A POST webhook endpoint on your service API, to call when the selected event occurs.
 
 ## Usage
 
-The `centralwebhook` tool is a service that runs continually, monitoring the
-ODK Central database for updates and triggering the webhook as appropriate.
+The `centralwebhook` tool is a CLI that installs or uninstalls database triggers. After installation, the triggers run automatically whenever audit events occur in the database.
 
-### Integrate Into [ODK Central](https://github.com/getodk/central) Stack
+### Install Triggers
 
-- It's possible to include this as part of the standard ODK Central docker
-  compose stack.
-- First add the environment variables to your `.env` file:
-
-    ```dotenv
-    CENTRAL_WEBHOOK_UPDATE_ENTITY_URL=https://your.domain.com/some/webhook
-    CENTRAL_WEBHOOK_REVIEW_SUBMISSION_URL=https://your.domain.com/some/webhook
-    CENTRAL_WEBHOOK_NEW_SUBMISSION_URL=https://your.domain.com/some/webhook
-    CENTRAL_WEBHOOK_API_KEY=your_api_key_key
-    ```
-
-> [!TIP]
-> Omit a xxx_URL variable if you do not wish to use that particular webhook.
->
-> The CENTRAL_WEBHOOK_API_KEY variable is also optional, see the
-> [APIs With Authentication](#apis-with-authentication) section.
-
-- Then extend the docker compose configuration at startup:
-
-    ```bash
-    # Starting from the getodk/central code repo
-    docker compose -f docker-compose.yml -f /path/to/this/repo/compose.webhook.yml up -d
-    ```
-
-### Other Ways To Run
-
-<details>
-<summary>Via Docker (Standalone)</summary>
-
-#### Via Docker (Standalone)
+Install webhook triggers in your database:
 
 ```bash
-docker run -d ghcr.io/hotosm/central-webhook:latest \
+./centralwebhook install \
     -db 'postgresql://{user}:{password}@{hostname}/{db}?sslmode=disable' \
     -updateEntityUrl 'https://your.domain.com/some/webhook' \
     -newSubmissionUrl 'https://your.domain.com/some/webhook' \
     -reviewSubmissionUrl 'https://your.domain.com/some/webhook'
 ```
 
-Environment variables are also supported:
+> [!TIP]
+> Omit a webhook URL flag if you do not wish to use that particular webhook.
+>
+> The `-apiKey` flag is optional, see the [APIs With Authentication](#apis-with-authentication) section.
+
+### Uninstall Triggers
+
+Remove webhook triggers from your database:
+
+```bash
+./centralwebhook uninstall \
+    -db 'postgresql://{user}:{password}@{hostname}/{db}?sslmode=disable'
+```
+
+### Environment Variables
+
+All flags can also be provided via environment variables:
 
 ```dotenv
 CENTRAL_WEBHOOK_DB_URI=postgresql://user:pass@localhost:5432/db_name?sslmode=disable
@@ -96,74 +84,22 @@ CENTRAL_WEBHOOK_API_KEY=ksdhfiushfiosehf98e3hrih39r8hy439rh389r3hy983y
 CENTRAL_WEBHOOK_LOG_LEVEL=DEBUG
 ```
 
-</details>
+### Via Docker
 
-<details>
-<summary>Via Binary (Standalone)</summary>
-
-#### Via Binary (Standalone)
-
-Download the binary for your platform from the
-[releases](https://github.com/hotosm/central-webhook/releases) page.
-
-Then run with:
+You can run the CLI tool via Docker:
 
 ```bash
-./centralwebhook \
+docker run --rm ghcr.io/hotosm/central-webhook:latest install \
     -db 'postgresql://{user}:{password}@{hostname}/{db}?sslmode=disable' \
     -updateEntityUrl 'https://your.domain.com/some/webhook' \
     -newSubmissionUrl 'https://your.domain.com/some/webhook' \
     -reviewSubmissionUrl 'https://your.domain.com/some/webhook'
 ```
 
-> It's possible to specify a single webhook event, or multiple.
+### Download Binary
 
-</details>
-
-<details>
-<summary>Via Code</summary>
-
-#### Via Code
-
-Usage via the code / API:
-
-```go
-package main
-
-import (
-    "fmt"
-    "context"
-    "log/slog"
-
-	"github.com/hotosm/central-webhook/db"
-	"github.com/hotosm/central-webhook/webhook"
-)
-
-ctx := context.Background()
-log := slog.New()
-
-dbPool, err := db.InitPool(ctx, log, "postgresql://{user}:{password}@{hostname}/{db}?sslmode=disable")
-if err != nil {
-    fmt.Fprintf(os.Stderr, "could not connect to database: %v", err)
-}
-
-err = SetupWebhook(
-    log,
-    ctx,
-    dbPool,
-    nil,
-    "https://your.domain.com/some/entity/webhook",
-    "https://your.domain.com/some/submission/webhook",
-    "https://your.domain.com/some/review/webhook",
-)
-if err != nil {
-    fmt.Fprintf(os.Stderr, "error setting up webhook: %v", err)
-}
-```
-
-> To not provide a webhook for an event, pass `nil` as the url.
-
-</details>
+Download the binary for your platform from the
+[releases](https://github.com/hotosm/central-webhook/releases) page.
 
 ## Webhook Request Payload Examples
 
@@ -208,7 +144,7 @@ Many APIs will not be public and require some sort of authentication.
 There is an optional `-apiKey` flag that can be used to pass
 an API key / token provided by the application.
 
-This will be inserted in the `X-API-Key` request header.
+This will be inserted in the `X-API-Key` request header when the trigger sends HTTP requests.
 
 No other authentication methods are supported for now, but feel
 free to open an issue (or PR!) for a proposal to support other
@@ -217,7 +153,7 @@ auth methods.
 Example:
 
 ```bash
-./centralwebhook \
+./centralwebhook install \
     -db 'postgresql://{user}:{password}@{hostname}/{db}?sslmode=disable' \
     -updateEntityUrl 'https://your.domain.com/some/webhook' \
     -apiKey 'ksdhfiushfiosehf98e3hrih39r8hy439rh389r3hy983y'
@@ -284,18 +220,25 @@ async def update_entity_status_in_fmtm(
         raise HTTPException(status_code=400, detail=msg)
 ```
 
+## How It Works
+
+The tool installs PostgreSQL triggers on the `audits` table that:
+
+1. Detect when audit events occur (entity updates, submission creates/updates)
+2. Format the event data into a JSON payload with `type`, `id`, and `data` fields
+3. Use the `pgsql-http` extension to send an HTTP POST request directly from the database
+4. Include the `X-API-Key` header if provided during installation
+
+The triggers run automatically after installation - no long-running service is needed.
+
 ## Development
 
-- This package mostly uses the standard library, plus a Postgres driver
-and testing framework.
+- This package uses the standard library and a Postgres driver.
 - Binary and container image distribution is automated on new **release**.
 
 ### Run The Tests
 
-The test suite depends on a database, so the most convenient way is to run
-via docker.
-
-There is a pre-configured `compose.yml` for testing:
+The test suite depends on a database with the `pgsql-http` extension installed. The most convenient way is to run via docker:
 
 ```bash
 docker compose run --rm webhook
