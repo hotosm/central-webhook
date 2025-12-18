@@ -283,7 +283,7 @@ func TestEntityTrigger(t *testing.T) {
 	tdb.Is.True(strings.Contains(functionSQL, "WHEN 'entity.update.version'"))
 	tdb.Is.True(strings.Contains(functionSQL, "'type', 'entity.update.version'"))
 	tdb.Is.True(strings.Contains(functionSQL, "'id', (NEW.details->'entity'->>'uuid')"))
-	tdb.Is.True(strings.Contains(functionSQL, "'data', result_data"))
+	tdb.Is.True(strings.Contains(functionSQL, "'data', entity_data"))
 
 	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
 	tdb.Is.NoErr(err)

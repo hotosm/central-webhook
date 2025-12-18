@@ -44,40 +44,51 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		url := quoteSQLString(*opts.UpdateEntityURL)
 		caseStatements += fmt.Sprintf(`
 			WHEN 'entity.update.version' THEN
-			-- Deduplicate: only fire for the first audit row for this entity UUID
-			IF EXISTS (
-				SELECT 1
-				FROM %s a
-				WHERE a.action = 'entity.update.version'
-				AND a.details->'entity'->>'uuid' = NEW.details->'entity'->>'uuid'
-				AND a.details ? 'webhook_sent'
-			) THEN
-				-- Already processed this entity
+			DECLARE
+				entity_data jsonb;
+				entity_payload jsonb;
+			BEGIN
+				-- Deduplicate: only fire for the first audit row for this entity UUID
+				IF EXISTS (
+					SELECT 1
+					FROM %s a
+					WHERE a.action = 'entity.update.version'
+					AND a.details->'entity'->>'uuid' = NEW.details->'entity'->>'uuid'
+					AND a.details ? 'webhook_sent'
+				) THEN
+					-- Already processed this entity
+					NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+					RETURN NEW;
+				END IF;
+
+				SELECT entity_defs."data"
+				INTO entity_data
+				FROM entity_defs
+				WHERE entity_defs.id = (NEW.details->>'entityDefId')::int;
+
+				IF entity_data IS NULL THEN
+					RAISE WARNING 'Entity def not found for entityDefId: %%', NEW.details->>'entityDefId';
+					NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+					RETURN NEW;
+				END IF;
+
+				entity_payload := jsonb_build_object(
+					'type', 'entity.update.version',
+					'id', (NEW.details->'entity'->>'uuid'),
+					'data', entity_data
+				);
+
+				PERFORM http((
+					'POST',
+					%s,
+					http_headers(%s),
+					'application/json',
+					entity_payload::text
+				)::http_request);
+
+				-- Mark as processed
 				NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
-				RETURN NEW;
-			END IF;
-
-			SELECT entity_defs."data"
-			INTO result_data
-			FROM entity_defs
-			WHERE entity_defs.id = (NEW.details->>'entityDefId')::int;
-
-			webhook_payload := jsonb_build_object(
-				'type', 'entity.update.version',
-				'id', (NEW.details->'entity'->>'uuid'),
-				'data', result_data
-			);
-
-			PERFORM http((
-				'POST',
-				%s,
-				http_headers(%s),
-				'application/json',
-				webhook_payload::text
-			)::http_request);
-
-			-- Mark as processed
-			NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+			END;
 		`, tableName, url, headersSQL)
 	}
 
@@ -88,40 +99,51 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		url := quoteSQLString(*opts.NewSubmissionURL)
 		caseStatements += fmt.Sprintf(`
 			WHEN 'submission.create' THEN
-			-- Deduplicate by instanceId
-			IF EXISTS (
-				SELECT 1
-				FROM %s a
-				WHERE a.action = 'submission.create'
-				AND a.details->>'instanceId' = NEW.details->>'instanceId'
-				AND a.details ? 'webhook_sent'
-			) THEN
-				-- Already processed
+			DECLARE
+				submission_data jsonb;
+				submission_payload jsonb;
+			BEGIN
+				-- Deduplicate by instanceId
+				IF EXISTS (
+					SELECT 1
+					FROM %s a
+					WHERE a.action = 'submission.create'
+					AND a.details->>'instanceId' = NEW.details->>'instanceId'
+					AND a.details ? 'webhook_sent'
+				) THEN
+					-- Already processed
+					NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+					RETURN NEW;
+				END IF;
+
+				SELECT jsonb_build_object('xml', submission_defs.xml)
+				INTO submission_data
+				FROM submission_defs
+				WHERE submission_defs.id = (NEW.details->>'submissionDefId')::int;
+
+				IF submission_data IS NULL THEN
+					RAISE WARNING 'Submission def not found for submissionDefId: %%', NEW.details->>'submissionDefId';
+					NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+					RETURN NEW;
+				END IF;
+
+				submission_payload := jsonb_build_object(
+					'type', 'submission.create',
+					'id', (NEW.details->>'instanceId'),
+					'data', submission_data
+				);
+
+				PERFORM http((
+					'POST',
+					%s,
+					http_headers(%s),
+					'application/json',
+					submission_payload::text
+				)::http_request);
+
+				-- Mark as processed
 				NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
-				RETURN NEW;
-			END IF;
-
-			SELECT jsonb_build_object('xml', submission_defs.xml)
-			INTO result_data
-			FROM submission_defs
-			WHERE submission_defs.id = (NEW.details->>'submissionDefId')::int;
-
-			webhook_payload := jsonb_build_object(
-				'type', 'submission.create',
-				'id', (NEW.details->>'instanceId'),
-				'data', result_data
-			);
-
-			PERFORM http((
-				'POST',
-				%s,
-				http_headers(%s),
-				'application/json',
-				webhook_payload::text
-			)::http_request);
-
-			-- Mark as processed
-			NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+			END;
 		`, tableName, url, headersSQL)
 	}
 
@@ -132,38 +154,42 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		url := quoteSQLString(*opts.ReviewSubmissionURL)
 		caseStatements += fmt.Sprintf(`
 			WHEN 'submission.update' THEN
-			-- Deduplicate by instanceId + reviewState
-			IF EXISTS (
-				SELECT 1
-				FROM %s a
-				WHERE a.action = 'submission.update'
-				AND a.details->>'instanceId' = NEW.details->>'instanceId'
-				AND a.details->>'reviewState' = NEW.details->>'reviewState'
-				AND a.details ? 'webhook_sent'
-			) THEN
-				-- Already processed
+			DECLARE
+				review_payload jsonb;
+			BEGIN
+				-- Deduplicate by instanceId + reviewState
+				IF EXISTS (
+					SELECT 1
+					FROM %s a
+					WHERE a.action = 'submission.update'
+					AND a.details->>'instanceId' = NEW.details->>'instanceId'
+					AND a.details->>'reviewState' = NEW.details->>'reviewState'
+					AND a.details ? 'webhook_sent'
+				) THEN
+					-- Already processed
+					NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+					RETURN NEW;
+				END IF;
+
+				review_payload := jsonb_build_object(
+					'type', 'submission.update',
+					'id', (NEW.details->>'instanceId'),
+					'data', jsonb_build_object(
+						'reviewState', NEW.details->>'reviewState'
+					)
+				);
+
+				PERFORM http((
+					'POST',
+					%s,
+					http_headers(%s),
+					'application/json',
+					review_payload::text
+				)::http_request);
+
+				-- Mark as processed
 				NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
-				RETURN NEW;
-			END IF;
-
-			webhook_payload := jsonb_build_object(
-				'type', 'submission.update',
-				'id', (NEW.details->>'instanceId'),
-				'data', jsonb_build_object(
-					'reviewState', NEW.details->>'reviewState'
-				)
-			);
-
-			PERFORM http((
-				'POST',
-				%s,
-				http_headers(%s),
-				'application/json',
-				webhook_payload::text
-			)::http_request);
-
-			-- Mark as processed
-			NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+			END;
 		`, tableName, url, headersSQL)
 	}
 
@@ -178,8 +204,6 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		$$
 		DECLARE
 			action_type text;
-			result_data jsonb;
-			webhook_payload jsonb;
 		BEGIN
 			action_type := NEW.action;
 
