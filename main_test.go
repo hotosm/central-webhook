@@ -166,8 +166,10 @@ func TestInstallCommand(t *testing.T) {
 	var triggerExists bool
 	err = conn.QueryRow(ctx, `
 		SELECT EXISTS(
-			SELECT 1 FROM pg_trigger 
-			WHERE tgname = 'new_audit_log_trigger'
+			SELECT 1 FROM information_schema.triggers
+			WHERE trigger_schema = 'public'
+			AND event_object_table = 'audits'
+			AND trigger_name = 'new_audit_log_trigger'
 		)
 	`).Scan(&triggerExists)
 	is.NoErr(err)
@@ -228,8 +230,10 @@ func TestUninstallCommand(t *testing.T) {
 	var triggerExists bool
 	err = conn.QueryRow(ctx, `
 		SELECT EXISTS(
-			SELECT 1 FROM pg_trigger 
-			WHERE tgname = 'new_audit_log_trigger'
+			SELECT 1 FROM information_schema.triggers
+			WHERE trigger_schema = 'public'
+			AND event_object_table = 'audits'
+			AND trigger_name = 'new_audit_log_trigger'
 		)
 	`).Scan(&triggerExists)
 	is.NoErr(err)
@@ -238,12 +242,17 @@ func TestUninstallCommand(t *testing.T) {
 	// Uninstall trigger
 	err = db.RemoveTrigger(ctx, pool, "audits")
 	is.NoErr(err)
+	
+	// Small delay to ensure cleanup completes
+	time.Sleep(100 * time.Millisecond)
 
 	// Verify trigger is removed
 	err = conn.QueryRow(ctx, `
 		SELECT EXISTS(
-			SELECT 1 FROM pg_trigger 
-			WHERE tgname = 'new_audit_log_trigger'
+			SELECT 1 FROM information_schema.triggers
+			WHERE trigger_schema = 'public'
+			AND event_object_table = 'audits'
+			AND trigger_name = 'new_audit_log_trigger'
 		)
 	`).Scan(&triggerExists)
 	is.NoErr(err)

@@ -241,22 +241,63 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 // Returns true if the error indicates the object was already
 // dropped or doesn't exist, which is fine when using DROP IF EXISTS
 func isAcceptableDropError(err error, acceptableCodes ...string) bool {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		return false
+	if err == nil {
+		return true
 	}
 
-	// XX000 = tuple concurrently updated (happens with parallel drops)
-	// 42704 = object does not exist (trigger/table)
-	// 42883 = function does not exist
-	codes := append([]string{"XX000", "42704", "42883"}, acceptableCodes...)
-	for _, code := range codes {
-		if pgErr.Code == code {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// XX000 = tuple concurrently updated (happens with parallel drops)
+		// 42704 = object does not exist (trigger/table)
+		// 42883 = function does not exist
+		codes := append([]string{"XX000", "42704", "42883"}, acceptableCodes...)
+		for _, code := range codes {
+			if pgErr.Code == code {
+				return true
+			}
+		}
+
+		if strings.Contains(pgErr.Message, "does not exist") {
 			return true
 		}
 	}
 
-	return strings.Contains(pgErr.Message, "does not exist")
+	// Also check the error string directly in case it's wrapped
+	errStr := err.Error()
+	if strings.Contains(errStr, "tuple concurrently updated") ||
+		strings.Contains(errStr, "does not exist") ||
+		strings.Contains(errStr, "SQLSTATE XX000") ||
+		strings.Contains(errStr, "SQLSTATE 42704") ||
+		strings.Contains(errStr, "SQLSTATE 42883") {
+		return true
+	}
+
+	return false
+}
+
+// checkTriggerExists checks if the trigger exists
+func checkTriggerExists(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
+	var exists bool
+	err := conn.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM pg_trigger 
+			WHERE tgname = 'new_audit_log_trigger'
+		)
+	`).Scan(&exists)
+	return exists, err
+}
+
+// checkFunctionExists checks if the function exists
+func checkFunctionExists(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
+	var exists bool
+	err := conn.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM pg_proc p
+			JOIN pg_namespace n ON p.pronamespace = n.oid
+			WHERE p.proname = 'new_audit_log' AND n.nspname = 'public'
+		)
+	`).Scan(&exists)
+	return exists, err
 }
 
 // RemoveTrigger removes the webhook trigger from the database

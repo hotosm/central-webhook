@@ -104,27 +104,8 @@ func createSubmissionDefsTable(ctx context.Context, conn *pgxpool.Conn, is *is.I
 	is.NoErr(err)
 }
 
-func TestEntityTrigger(t *testing.T) {
-	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
-	if len(dbUri) == 0 {
-		// Default
-		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
-	}
-
-	is := is.New(t)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	ctx := context.Background()
-	pool, err := InitPool(ctx, log, dbUri)
-	is.NoErr(err)
-	defer pool.Close()
-
-	// Get connection and defer close
-	conn, err := pool.Acquire(ctx)
-	is.NoErr(err)
-	defer conn.Release()
-
-	// Create entity_defs table
-	_, err = conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs CASCADE;`)
+func createEntityDefsTable(ctx context.Context, conn *pgxpool.Conn, is *is.I) {
+	_, err := conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs CASCADE;`)
 	is.NoErr(err)
 	entityTableCreateSql := `
 		CREATE TABLE entity_defs (
@@ -139,18 +120,48 @@ func TestEntityTrigger(t *testing.T) {
 	`
 	_, err = conn.Exec(ctx, entityTableCreateSql)
 	is.NoErr(err)
+}
 
-	// Create audits_test table
-	createAuditTestsTable(ctx, conn, is)
+type testDB struct {
+	URI    string
+	Pool   *pgxpool.Pool
+	Conn   *pgxpool.Conn
+	Log    *slog.Logger
+	Ctx    context.Context
+	Is     *is.I
+}
 
-	// Create audit trigger pointing at a dummy URL – we just inspect the SQL
-	dummyURL := "http://example.com/webhook"
-	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
-		UpdateEntityURL: &dummyURL,
-	})
+func setupTestDB(t *testing.T) *testDB {
+	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
+	if dbUri == "" {
+		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
+	}
+
+	is := is.New(t)
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	ctx := context.Background()
+	pool, err := InitPool(ctx, log, dbUri)
 	is.NoErr(err)
 
-	// Read back the generated function and assert the entity CASE branch exists
+	conn, err := pool.Acquire(ctx)
+	is.NoErr(err)
+
+	return &testDB{
+		URI:  dbUri,
+		Pool: pool,
+		Conn: conn,
+		Log:  log,
+		Ctx:  ctx,
+		Is:   is,
+	}
+}
+
+func (tdb *testDB) Close() {
+	tdb.Conn.Release()
+	tdb.Pool.Close()
+}
+
+func getFunctionSQL(ctx context.Context, conn *pgxpool.Conn) (string, error) {
 	var functionSQL string
 	row := conn.QueryRow(ctx, `
 		SELECT pg_get_functiondef(p.oid)
@@ -158,288 +169,252 @@ func TestEntityTrigger(t *testing.T) {
 		JOIN pg_namespace n ON p.pronamespace = n.oid
 		WHERE p.proname = 'new_audit_log' AND n.nspname = 'public'
 	`)
-	err = row.Scan(&functionSQL)
-	is.NoErr(err)
-
-	is.True(strings.Contains(functionSQL, "WHEN 'entity.update.version'"))
-	is.True(strings.Contains(functionSQL, "'type', 'entity.update.version'"))
-	is.True(strings.Contains(functionSQL, "'id', (NEW.details->'entity'->>'uuid')"))
-	is.True(strings.Contains(functionSQL, "'data', result_data"))
-
-	// Cleanup
-	err = RemoveTrigger(ctx, pool, "audits_test")
-	is.NoErr(err)
-	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs, audits_test CASCADE;`)
+	err := row.Scan(&functionSQL)
+	return functionSQL, err
 }
 
-// Test a new submission event type
-func TestNewSubmissionTrigger(t *testing.T) {
-	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
-	if len(dbUri) == 0 {
-		// Default
-		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
+
+type webhookServer struct {
+	*testServer
+	payload        map[string]interface{}
+	headers        http.Header
+	requestCount   int
+	mu             sync.Mutex
+	requestWG      sync.WaitGroup
+	capturePayload bool
+	captureHeaders bool
+	is             *is.I
+	expectedCount  int
+}
+
+func createWebhookServer(is *is.I, capturePayload, captureHeaders bool) (*webhookServer, error) {
+	return createWebhookServerWithExpected(is, capturePayload, captureHeaders, 1)
+}
+
+func createWebhookServerWithExpected(is *is.I, capturePayload, captureHeaders bool, expectedCount int) (*webhookServer, error) {
+	ws := &webhookServer{
+		capturePayload: capturePayload,
+		captureHeaders: captureHeaders,
+		is:             is,
+		expectedCount:  expectedCount,
 	}
-
-	is := is.New(t)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	ctx := context.Background()
-	pool, err := InitPool(ctx, log, dbUri)
-	is.NoErr(err)
-	defer pool.Close()
-
-	// Get connection and defer close
-	conn, err := pool.Acquire(ctx)
-	is.NoErr(err)
-	defer conn.Release()
-	_, _ = conn.Exec(ctx, `DROP FUNCTION IF EXISTS new_audit_log() CASCADE;`)
-
-	// Create submission_defs table
-	createSubmissionDefsTable(ctx, conn, is)
-
-	// Create audits_test table
-	createAuditTestsTable(ctx, conn, is)
-
-	// Insert an submission record
-	submissionInsertSql := `
-		INSERT INTO submission_defs (
-			id,
-			"submissionId",
-			xml,
-			"formDefId",
-			"submitterId",
-			"createdAt"
-		) VALUES (
-		 	1,
-            2,
-			'<data id="xxx">',
-			7,
-			5,
-			'2025-01-10 16:23:40.073'
-		);
-	`
-	_, err = conn.Exec(ctx, submissionInsertSql)
-	is.NoErr(err)
-
-	// Create HTTP test server to receive webhook
-	var receivedPayload map[string]interface{}
-	var requestReceived sync.WaitGroup
-	requestReceived.Add(1)
+	ws.requestWG.Add(expectedCount)
 
 	server, err := createTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		body, err := io.ReadAll(r.Body)
-		is.NoErr(err)
-		err = json.Unmarshal(body, &receivedPayload)
-		is.NoErr(err)
+		ws.mu.Lock()
+		ws.requestCount++
+		currentCount := ws.requestCount
+		ws.mu.Unlock()
+
+		if ws.captureHeaders {
+			ws.headers = r.Header
+		}
+
+		if ws.capturePayload {
+			defer r.Body.Close()
+			body, err := io.ReadAll(r.Body)
+			ws.is.NoErr(err)
+			err = json.Unmarshal(body, &ws.payload)
+			ws.is.NoErr(err)
+		}
+
 		w.WriteHeader(http.StatusOK)
-		requestReceived.Done()
+		if currentCount <= ws.expectedCount {
+			ws.requestWG.Done()
+		}
 	}))
-	is.NoErr(err)
+	if err != nil {
+		return nil, err
+	}
+
+	ws.testServer = server
+	return ws, nil
+}
+
+func (ws *webhookServer) Payload() map[string]interface{} {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.payload
+}
+
+func (ws *webhookServer) Headers() http.Header {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.headers
+}
+
+func (ws *webhookServer) WaitForRequest(timeout time.Duration) error {
+	done := make(chan struct{})
+	go func() {
+		ws.requestWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("timeout waiting for webhook request")
+	}
+}
+
+func (ws *webhookServer) GetCount() int {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.requestCount
+}
+
+func TestEntityTrigger(t *testing.T) {
+	tdb := setupTestDB(t)
+	defer tdb.Close()
+
+	createEntityDefsTable(tdb.Ctx, tdb.Conn, tdb.Is)
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
+
+	dummyURL := "http://example.com/webhook"
+	err := CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
+		UpdateEntityURL: &dummyURL,
+	})
+	tdb.Is.NoErr(err)
+
+	functionSQL, err := getFunctionSQL(tdb.Ctx, tdb.Conn)
+	tdb.Is.NoErr(err)
+
+	tdb.Is.True(strings.Contains(functionSQL, "WHEN 'entity.update.version'"))
+	tdb.Is.True(strings.Contains(functionSQL, "'type', 'entity.update.version'"))
+	tdb.Is.True(strings.Contains(functionSQL, "'id', (NEW.details->'entity'->>'uuid')"))
+	tdb.Is.True(strings.Contains(functionSQL, "'data', result_data"))
+
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS entity_defs, audits_test CASCADE;`)
+}
+
+func TestNewSubmissionTrigger(t *testing.T) {
+	tdb := setupTestDB(t)
+	defer tdb.Close()
+
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP FUNCTION IF EXISTS new_audit_log() CASCADE;`)
+	createSubmissionDefsTable(tdb.Ctx, tdb.Conn, tdb.Is)
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
+
+	_, err := tdb.Conn.Exec(tdb.Ctx, `
+		INSERT INTO submission_defs (id, "submissionId", xml, "formDefId", "submitterId", "createdAt")
+		VALUES (1, 2, '<data id="xxx">', 7, 5, '2025-01-10 16:23:40.073');
+	`)
+	tdb.Is.NoErr(err)
+
+	server, err := createWebhookServer(tdb.Is, true, false)
+	tdb.Is.NoErr(err)
 	defer server.Close()
 
-	// Create audit trigger
-	newSubmissionUrl := server.URL
-	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
-		NewSubmissionURL: &newSubmissionUrl,
+	err = CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
+		NewSubmissionURL: &server.URL,
 	})
-	is.NoErr(err)
+	tdb.Is.NoErr(err)
 
-	// Insert an audit record
-	auditInsertSql := `
+	_, err = tdb.Conn.Exec(tdb.Ctx, `
 		INSERT INTO audits_test ("actorId", action, details)
 		VALUES (5, 'submission.create', '{"submissionDefId": 1, "instanceId": "test-instance-123"}');
-	`
-	_, err = conn.Exec(ctx, auditInsertSql)
-	is.NoErr(err)
+	`)
+	tdb.Is.NoErr(err)
 
-	// Wait for HTTP request to be received
-	done := make(chan struct{})
-	go func() {
-		requestReceived.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Request received successfully
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for webhook request")
+	err = server.WaitForRequest(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Validate the webhook payload
-	is.True(receivedPayload != nil)
-	is.Equal(receivedPayload["type"], "submission.create")
-	is.Equal(receivedPayload["id"], "test-instance-123")
-	is.True(receivedPayload["data"] != nil)
+	payload := server.Payload()
+	tdb.Is.True(payload != nil)
+	tdb.Is.Equal(payload["type"], "submission.create")
+	tdb.Is.Equal(payload["id"], "test-instance-123")
+	tdb.Is.True(payload["data"] != nil)
 
-	data, ok := receivedPayload["data"].(map[string]interface{})
-	is.True(ok)                              // Ensure data is a valid map
-	is.Equal(data["xml"], `<data id="xxx">`) // Ensure `xml` has the correct value
+	data, ok := payload["data"].(map[string]interface{})
+	tdb.Is.True(ok)
+	tdb.Is.Equal(data["xml"], `<data id="xxx">`)
 
-	// Cleanup
-	err = RemoveTrigger(ctx, pool, "audits_test")
-	is.NoErr(err)
-	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
 }
 
-// Test a review submission event type
 func TestReviewSubmissionTrigger(t *testing.T) {
-	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
-	if len(dbUri) == 0 {
-		// Default
-		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
-	}
+	tdb := setupTestDB(t)
+	defer tdb.Close()
 
-	is := is.New(t)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	ctx := context.Background()
-	pool, err := InitPool(ctx, log, dbUri)
-	is.NoErr(err)
-	defer pool.Close()
+	createSubmissionDefsTable(tdb.Ctx, tdb.Conn, tdb.Is)
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
 
-	// Get connection and defer close
-	conn, err := pool.Acquire(ctx)
-	is.NoErr(err)
-	defer conn.Release()
+	_, err := tdb.Conn.Exec(tdb.Ctx, `
+		INSERT INTO submission_defs (id, "submissionId", "instanceId")
+		VALUES (1, 2, '33448049-0df1-4426-9392-d3a294d638ad');
+	`)
+	tdb.Is.NoErr(err)
 
-	// Create submission_defs table
-	createSubmissionDefsTable(ctx, conn, is)
-
-	// Create audits_test table
-	createAuditTestsTable(ctx, conn, is)
-
-	// Insert an submission record
-	submissionInsertSql := `
-		INSERT INTO submission_defs (
-			id,
-			"submissionId",
-			"instanceId"
-		) VALUES (
-		 	1,
-            2,
-			'33448049-0df1-4426-9392-d3a294d638ad'
-		);
-	`
-	_, err = conn.Exec(ctx, submissionInsertSql)
-	is.NoErr(err)
-
-	// Create HTTP test server to receive webhook
-	var receivedPayload map[string]interface{}
-	var requestReceived sync.WaitGroup
-	requestReceived.Add(1)
-
-	server, err := createTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		body, err := io.ReadAll(r.Body)
-		is.NoErr(err)
-		err = json.Unmarshal(body, &receivedPayload)
-		is.NoErr(err)
-		w.WriteHeader(http.StatusOK)
-		requestReceived.Done()
-	}))
-	is.NoErr(err)
+	server, err := createWebhookServer(tdb.Is, true, false)
+	tdb.Is.NoErr(err)
 	defer server.Close()
 
-	// Create audit trigger
-	reviewSubmissionUrl := server.URL
-	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
-		ReviewSubmissionURL: &reviewSubmissionUrl,
+	err = CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
+		ReviewSubmissionURL: &server.URL,
 	})
-	is.NoErr(err)
+	tdb.Is.NoErr(err)
 
-	// Insert an audit record
-	auditInsertSql := `
+	_, err = tdb.Conn.Exec(tdb.Ctx, `
 		INSERT INTO audits_test ("actorId", action, details)
 		VALUES (5, 'submission.update', '{"submissionDefId": 1, "instanceId": "33448049-0df1-4426-9392-d3a294d638ad", "reviewState": "approved"}');
-	`
-	_, err = conn.Exec(ctx, auditInsertSql)
-	is.NoErr(err)
+	`)
+	tdb.Is.NoErr(err)
 
-	// Wait for HTTP request to be received
-	done := make(chan struct{})
-	go func() {
-		requestReceived.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Request received successfully
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for webhook request")
+	err = server.WaitForRequest(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Validate the webhook payload
-	is.True(receivedPayload != nil)
-	is.Equal(receivedPayload["type"], "submission.update")
-	is.Equal(receivedPayload["id"], "33448049-0df1-4426-9392-d3a294d638ad")
+	payload := server.Payload()
+	tdb.Is.True(payload != nil)
+	tdb.Is.Equal(payload["type"], "submission.update")
+	tdb.Is.Equal(payload["id"], "33448049-0df1-4426-9392-d3a294d638ad")
 
-	// Check reviewState present in data key
-	data, ok := receivedPayload["data"].(map[string]interface{})
-	is.True(ok)                               // Ensure data is a valid map
-	is.Equal(data["reviewState"], "approved") // Ensure reviewState has the correct value
+	data, ok := payload["data"].(map[string]interface{})
+	tdb.Is.True(ok)
+	tdb.Is.Equal(data["reviewState"], "approved")
 
-	// Cleanup
-	err = RemoveTrigger(ctx, pool, "audits_test")
-	is.NoErr(err)
-	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
 }
 
-// Test an unsupported event type and ensure nothing is triggered
 func TestNoTrigger(t *testing.T) {
-	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
-	if len(dbUri) == 0 {
-		// Default
-		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
-	}
+	tdb := setupTestDB(t)
+	defer tdb.Close()
 
-	is := is.New(t)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	ctx := context.Background()
-	pool, err := InitPool(ctx, log, dbUri)
-	is.NoErr(err)
-	defer pool.Close()
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
 
-	// Get connection and defer close
-	conn, err := pool.Acquire(ctx)
-	is.NoErr(err)
-	defer conn.Release()
-
-	// Create audits_test table
-	createAuditTestsTable(ctx, conn, is)
-
-	// Create HTTP test server to receive webhook
 	var requestReceived sync.WaitGroup
 	requestReceived.Add(1)
-
 	server, err := createTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestReceived.Done()
 		w.WriteHeader(http.StatusOK)
 	}))
-	is.NoErr(err)
+	tdb.Is.NoErr(err)
 	defer server.Close()
 
-	// Create audit trigger
-	newSubmissionUrl := server.URL
-	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
-		NewSubmissionURL: &newSubmissionUrl,
+	err = CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
+		NewSubmissionURL: &server.URL,
 	})
-	is.NoErr(err)
+	tdb.Is.NoErr(err)
 
-	// Insert an audit record with unsupported event type
-	auditInsertSql := `
+	_, err = tdb.Conn.Exec(tdb.Ctx, `
 		INSERT INTO audits_test ("actorId", action, details)
 		VALUES (1, 'invalid.event', '{"submissionDefId": 5}');
-	`
-	_, err = conn.Exec(ctx, auditInsertSql)
-	is.NoErr(err)
+	`)
+	tdb.Is.NoErr(err)
 
-	// Validate that no event was triggered for invalid event type
-	// The HTTP server should not receive a request
 	select {
 	case <-time.After(2 * time.Second):
-		// No request received - this is expected
-		log.Info("no event triggered for invalid event type")
+		tdb.Log.Info("no event triggered for invalid event type")
 	case <-func() chan struct{} {
 		done := make(chan struct{})
 		go func() {
@@ -448,562 +423,244 @@ func TestNoTrigger(t *testing.T) {
 		}()
 		return done
 	}():
-		// If a request was received, we failed the test
 		t.Fatal("unexpected webhook request received for invalid event type")
 	}
 
-	// Cleanup - only drop audits_test since submission_defs wasn't created in this test
-	err = RemoveTrigger(ctx, pool, "audits_test")
-	is.NoErr(err)
-	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS audits_test CASCADE;`)
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS audits_test CASCADE;`)
 }
 
-// Test that only the related CASE statements are added to the SQL function
 func TestModularSql(t *testing.T) {
-	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
-	if len(dbUri) == 0 {
-		// Default
-		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
-	}
+	tdb := setupTestDB(t)
+	defer tdb.Close()
 
-	is := is.New(t)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	ctx := context.Background()
-	pool, err := InitPool(ctx, log, dbUri)
-	is.NoErr(err)
-	defer pool.Close()
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
 
-	// Get connection and defer close
-	conn, err := pool.Acquire(ctx)
-	is.NoErr(err)
-	defer conn.Release()
-
-	// Create audits_test table
-	createAuditTestsTable(ctx, conn, is)
-
-	// Create audit trigger
 	updateEntityUrl := "https://test.com"
-	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+	err := CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
 		UpdateEntityURL: &updateEntityUrl,
 	})
-	is.NoErr(err)
+	tdb.Is.NoErr(err)
 
-	// Verify the function only contains the entity.update.version CASE
-	var functionSQL string
-	row := conn.QueryRow(ctx, `
-		SELECT pg_get_functiondef(p.oid)
-		FROM pg_proc p
-		JOIN pg_namespace n ON p.pronamespace = n.oid
-		WHERE p.proname = 'new_audit_log' AND n.nspname = 'public'
-	`)
-	err = row.Scan(&functionSQL)
-	is.NoErr(err)
+	functionSQL, err := getFunctionSQL(tdb.Ctx, tdb.Conn)
+	tdb.Is.NoErr(err)
 
-	// Check that the expected CASE branch is present
-	is.True(strings.Contains(functionSQL, "WHEN 'entity.update.version'"))
-	// Ensure that other cases are not present
-	is.True(!strings.Contains(functionSQL, "WHEN 'submission.create'"))
-	is.True(!strings.Contains(functionSQL, "WHEN 'submission.update'"))
+	tdb.Is.True(strings.Contains(functionSQL, "WHEN 'entity.update.version'"))
+	tdb.Is.True(!strings.Contains(functionSQL, "WHEN 'submission.create'"))
+	tdb.Is.True(!strings.Contains(functionSQL, "WHEN 'submission.update'"))
 
-	// Cleanup
-	err = RemoveTrigger(ctx, pool, "audits_test")
-	is.NoErr(err)
-	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS audits_test CASCADE;`)
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS audits_test CASCADE;`)
 }
 
-// Test RemoveTrigger function
 func TestRemoveTrigger(t *testing.T) {
-	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
-	if len(dbUri) == 0 {
-		// Default
-		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
-	}
+	tdb := setupTestDB(t)
+	defer tdb.Close()
 
-	is := is.New(t)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	ctx := context.Background()
-	pool, err := InitPool(ctx, log, dbUri)
-	is.NoErr(err)
-	defer pool.Close()
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
 
-	conn, err := pool.Acquire(ctx)
-	is.NoErr(err)
-	defer conn.Release()
-
-	// Create audits_test table
-	createAuditTestsTable(ctx, conn, is)
-
-	// Create trigger
 	updateEntityUrl := "https://test.com"
-	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+	err := CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
 		UpdateEntityURL: &updateEntityUrl,
 	})
-	is.NoErr(err)
+	tdb.Is.NoErr(err)
 
-	// Verify trigger exists
-	var triggerExists bool
-	err = conn.QueryRow(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM pg_trigger 
-			WHERE tgname = 'new_audit_log_trigger'
-		)
-	`).Scan(&triggerExists)
-	is.NoErr(err)
-	is.True(triggerExists)
+	triggerExists, err := checkTriggerExists(tdb.Ctx, tdb.Conn)
+	tdb.Is.NoErr(err)
+	tdb.Is.True(triggerExists)
 
-	// Verify function exists
-	var functionExists bool
-	err = conn.QueryRow(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM pg_proc p
-			JOIN pg_namespace n ON p.pronamespace = n.oid
-			WHERE p.proname = 'new_audit_log' AND n.nspname = 'public'
-		)
-	`).Scan(&functionExists)
-	is.NoErr(err)
-	is.True(functionExists)
+	functionExists, err := checkFunctionExists(tdb.Ctx, tdb.Conn)
+	tdb.Is.NoErr(err)
+	tdb.Is.True(functionExists)
 
-	// Remove trigger
-	err = RemoveTrigger(ctx, pool, "audits_test")
-	is.NoErr(err)
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
 
-	// Verify trigger is removed
-	err = conn.QueryRow(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM pg_trigger 
-			WHERE tgname = 'new_audit_log_trigger'
-		)
-	`).Scan(&triggerExists)
-	is.NoErr(err)
-	is.True(!triggerExists)
+	triggerExists, err = checkTriggerExists(tdb.Ctx, tdb.Conn)
+	tdb.Is.NoErr(err)
+	tdb.Is.True(!triggerExists)
 
-	// Verify function is removed
-	err = conn.QueryRow(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM pg_proc p
-			JOIN pg_namespace n ON p.pronamespace = n.oid
-			WHERE p.proname = 'new_audit_log' AND n.nspname = 'public'
-		)
-	`).Scan(&functionExists)
-	is.NoErr(err)
-	is.True(!functionExists)
+	functionExists, err = checkFunctionExists(tdb.Ctx, tdb.Conn)
+	tdb.Is.NoErr(err)
+	tdb.Is.True(!functionExists)
 
-	// Cleanup
-	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS audits_test CASCADE;`)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS audits_test CASCADE;`)
 }
 
-// Test API key is included in headers
 func TestTriggerWithAPIKey(t *testing.T) {
-	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
-	if len(dbUri) == 0 {
-		// Default
-		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
-	}
+	tdb := setupTestDB(t)
+	defer tdb.Close()
 
-	is := is.New(t)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	ctx := context.Background()
-	pool, err := InitPool(ctx, log, dbUri)
-	is.NoErr(err)
-	defer pool.Close()
+	createEntityDefsTable(tdb.Ctx, tdb.Conn, tdb.Is)
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
 
-	conn, err := pool.Acquire(ctx)
-	is.NoErr(err)
-	defer conn.Release()
+	_, err := tdb.Conn.Exec(tdb.Ctx, `
+		INSERT INTO entity_defs (id, "entityId", "createdAt", "current", "data", "creatorId", "label")
+		VALUES (1001, 900, '2025-01-10 16:23:40.073', true, '{"status": "0"}', 5, 'Test Entity');
+	`)
+	tdb.Is.NoErr(err)
 
-	// Create entity_defs table
-	_, err = conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs CASCADE;`)
-	is.NoErr(err)
-	entityTableCreateSql := `
-		CREATE TABLE entity_defs (
-			id int4,
-			"entityId" int4,
-			"createdAt" timestamptz,
-			"current" bool,
-			"data" jsonb,
-			"creatorId" int4,
-			"label" text
-		);
-	`
-	_, err = conn.Exec(ctx, entityTableCreateSql)
-	is.NoErr(err)
-
-	// Create audits_test table
-	createAuditTestsTable(ctx, conn, is)
-
-	// Insert an entity record
-	entityInsertSql := `
-		INSERT INTO public.entity_defs (
-			id, "entityId","createdAt","current","data","creatorId","label"
-		) VALUES (
-		 	1001,
-			900,
-			'2025-01-10 16:23:40.073',
-			true,
-			'{"status": "0"}',
-			5,
-			'Test Entity'
-		);
-	`
-	_, err = conn.Exec(ctx, entityInsertSql)
-	is.NoErr(err)
-
-	// Create HTTP test server to receive webhook
-	var receivedHeaders http.Header
-	var requestReceived sync.WaitGroup
-	requestReceived.Add(1)
-
-	server, err := createTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedHeaders = r.Header
-		w.WriteHeader(http.StatusOK)
-		requestReceived.Done()
-	}))
-	is.NoErr(err)
+	server, err := createWebhookServer(tdb.Is, false, true)
+	tdb.Is.NoErr(err)
 	defer server.Close()
 
-	// Create audit trigger with API key
-	updateEntityUrl := server.URL
 	apiKey := "test-api-key-12345"
-	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
-		UpdateEntityURL: &updateEntityUrl,
+	err = CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
+		UpdateEntityURL: &server.URL,
 		APIKey:          &apiKey,
 	})
-	is.NoErr(err)
+	tdb.Is.NoErr(err)
 
-	// Insert an audit record to trigger the webhook
-	auditInsertSql := `
+	_, err = tdb.Conn.Exec(tdb.Ctx, `
 		INSERT INTO audits_test ("actorId", action, details)
 		VALUES (1, 'entity.update.version', '{"entityDefId": 1001, "entity": {"uuid": "test-uuid", "dataset": "test"}}');
-	`
-	_, err = conn.Exec(ctx, auditInsertSql)
-	is.NoErr(err)
+	`)
+	tdb.Is.NoErr(err)
 
-	// Wait for HTTP request to be received
-	done := make(chan struct{})
-	go func() {
-		requestReceived.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Request received successfully
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for webhook request")
+	err = server.WaitForRequest(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Validate API key header
-	is.Equal(receivedHeaders.Get("X-API-Key"), "test-api-key-12345")
-	is.Equal(receivedHeaders.Get("Content-Type"), "application/json")
+	headers := server.Headers()
+	tdb.Is.Equal(headers.Get("X-API-Key"), "test-api-key-12345")
+	tdb.Is.Equal(headers.Get("Content-Type"), "application/json")
 
-	// Cleanup
-	err = RemoveTrigger(ctx, pool, "audits_test")
-	is.NoErr(err)
-	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs, audits_test CASCADE;`)
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS entity_defs, audits_test CASCADE;`)
 }
 
-// Verifies only one webhook is sent for duplicate entity updates
 func TestDeduplicationEntityUpdate(t *testing.T) {
-	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
-	if len(dbUri) == 0 {
-		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
-	}
+	tdb := setupTestDB(t)
+	defer tdb.Close()
 
-	is := is.New(t)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	ctx := context.Background()
-	pool, err := InitPool(ctx, log, dbUri)
-	is.NoErr(err)
-	defer pool.Close()
+	_, err := tdb.Conn.Exec(tdb.Ctx, `
+		DROP TABLE IF EXISTS entity_defs CASCADE;
+		CREATE TABLE entity_defs (id int4, "entityId" int4, "data" jsonb);
+		INSERT INTO entity_defs (id, "entityId", "data") VALUES (1001, 900, '{"status": "active"}');
+	`)
+	tdb.Is.NoErr(err)
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
 
-	conn, err := pool.Acquire(ctx)
-	is.NoErr(err)
-	defer conn.Release()
-
-	// Create entity_defs table
-	_, err = conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs CASCADE;`)
-	is.NoErr(err)
-	entityTableCreateSql := `
-		CREATE TABLE entity_defs (
-			id int4,
-			"entityId" int4,
-			"data" jsonb
-		);
-	`
-	_, err = conn.Exec(ctx, entityTableCreateSql)
-	is.NoErr(err)
-
-	// Insert entity record
-	entityInsertSql := `
-		INSERT INTO entity_defs (id, "entityId", "data")
-		VALUES (1001, 900, '{"status": "active"}');
-	`
-	_, err = conn.Exec(ctx, entityInsertSql)
-	is.NoErr(err)
-
-	// Create audits_test table
-	createAuditTestsTable(ctx, conn, is)
-
-	// Track webhook calls
-	var webhookCallCount int
-	var mu sync.Mutex
-	var requestReceived sync.WaitGroup
-	requestReceived.Add(1) // Expect only 1 call
-
-	server, err := createTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		webhookCallCount++
-		mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		if webhookCallCount == 1 {
-			requestReceived.Done()
-		}
-	}))
-	is.NoErr(err)
+	server, err := createWebhookServer(tdb.Is, false, false)
+	tdb.Is.NoErr(err)
 	defer server.Close()
 
-	// Create trigger
-	updateEntityUrl := server.URL
-	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
-		UpdateEntityURL: &updateEntityUrl,
+	err = CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
+		UpdateEntityURL: &server.URL,
 	})
-	is.NoErr(err)
+	tdb.Is.NoErr(err)
 
-	// Insert the same audit event 3 times (simulating duplicate events)
 	for i := 0; i < 3; i++ {
-		auditInsertSql := `
+		_, err = tdb.Conn.Exec(tdb.Ctx, `
 			INSERT INTO audits_test ("actorId", action, details)
 			VALUES (1, 'entity.update.version', '{"entityDefId": 1001, "entity": {"uuid": "test-uuid-123"}}');
-		`
-		_, err = conn.Exec(ctx, auditInsertSql)
-		is.NoErr(err)
+		`)
+		tdb.Is.NoErr(err)
 	}
 
-	// Wait for webhook(s)
-	done := make(chan struct{})
-	go func() {
-		requestReceived.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Expected - got first webhook
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for webhook request")
+	err = server.WaitForRequest(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Wait a bit more to ensure no additional webhooks arrive
 	time.Sleep(2 * time.Second)
+	tdb.Is.Equal(server.GetCount(), 1)
 
-	mu.Lock()
-	finalCount := webhookCallCount
-	mu.Unlock()
-
-	// Should only have received 1 webhook despite 3 audit inserts
-	is.Equal(finalCount, 1)
-
-	// Cleanup
-	err = RemoveTrigger(ctx, pool, "audits_test")
-	is.NoErr(err)
-	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs, audits_test CASCADE;`)
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS entity_defs, audits_test CASCADE;`)
 }
 
-// Verifies only one webhook for duplicate submission creates
 func TestDeduplicationSubmissionCreate(t *testing.T) {
-	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
-	if len(dbUri) == 0 {
-		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
-	}
+	tdb := setupTestDB(t)
+	defer tdb.Close()
 
-	is := is.New(t)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	ctx := context.Background()
-	pool, err := InitPool(ctx, log, dbUri)
-	is.NoErr(err)
-	defer pool.Close()
+	createSubmissionDefsTable(tdb.Ctx, tdb.Conn, tdb.Is)
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
 
-	conn, err := pool.Acquire(ctx)
-	is.NoErr(err)
-	defer conn.Release()
-
-	// Create tables
-	createSubmissionDefsTable(ctx, conn, is)
-	createAuditTestsTable(ctx, conn, is)
-
-	// Insert submission record
-	submissionInsertSql := `
+	_, err := tdb.Conn.Exec(tdb.Ctx, `
 		INSERT INTO submission_defs (id, "submissionId", xml)
 		VALUES (1, 2, '<data id="test"/>');
-	`
-	_, err = conn.Exec(ctx, submissionInsertSql)
-	is.NoErr(err)
+	`)
+	tdb.Is.NoErr(err)
 
-	// Track webhook calls
-	var webhookCallCount int
-	var mu sync.Mutex
-	var requestReceived sync.WaitGroup
-	requestReceived.Add(1)
-
-	server, err := createTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		webhookCallCount++
-		mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		if webhookCallCount == 1 {
-			requestReceived.Done()
-		}
-	}))
-	is.NoErr(err)
+	server, err := createWebhookServer(tdb.Is, false, false)
+	tdb.Is.NoErr(err)
 	defer server.Close()
 
-	// Create trigger
-	newSubmissionUrl := server.URL
-	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
-		NewSubmissionURL: &newSubmissionUrl,
+	err = CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
+		NewSubmissionURL: &server.URL,
 	})
-	is.NoErr(err)
+	tdb.Is.NoErr(err)
 
-	// Insert duplicate audit events for the same instanceId
 	instanceId := "dup-test-instance-456"
 	for i := 0; i < 3; i++ {
-		auditInsertSql := fmt.Sprintf(`
+		_, err = tdb.Conn.Exec(tdb.Ctx, fmt.Sprintf(`
 			INSERT INTO audits_test ("actorId", action, details)
 			VALUES (5, 'submission.create', '{"submissionDefId": 1, "instanceId": "%s"}');
-		`, instanceId)
-		_, err = conn.Exec(ctx, auditInsertSql)
-		is.NoErr(err)
+		`, instanceId))
+		tdb.Is.NoErr(err)
 	}
 
-	// Wait for first webhook
-	done := make(chan struct{})
-	go func() {
-		requestReceived.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Expected
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for webhook request")
+	err = server.WaitForRequest(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Wait to ensure no additional webhooks
 	time.Sleep(2 * time.Second)
+	tdb.Is.Equal(server.GetCount(), 1)
 
-	mu.Lock()
-	finalCount := webhookCallCount
-	mu.Unlock()
-
-	is.Equal(finalCount, 1)
-
-	// Cleanup
-	err = RemoveTrigger(ctx, pool, "audits_test")
-	is.NoErr(err)
-	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
 }
 
-// Verify only one webhook per reviewState transition
 func TestDeduplicationSubmissionUpdate(t *testing.T) {
-	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
-	if len(dbUri) == 0 {
-		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
-	}
+	tdb := setupTestDB(t)
+	defer tdb.Close()
 
-	is := is.New(t)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	ctx := context.Background()
-	pool, err := InitPool(ctx, log, dbUri)
-	is.NoErr(err)
-	defer pool.Close()
+	createSubmissionDefsTable(tdb.Ctx, tdb.Conn, tdb.Is)
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
 
-	conn, err := pool.Acquire(ctx)
-	is.NoErr(err)
-	defer conn.Release()
-
-	// Create tables
-	createSubmissionDefsTable(ctx, conn, is)
-	createAuditTestsTable(ctx, conn, is)
-
-	// Track webhook calls - need to expect 2 total
-	var webhookCallCount int
-	var mu sync.Mutex
-	var allWebhooksReceived sync.WaitGroup
-	allWebhooksReceived.Add(2) // Expect 2 webhooks total
-
-	server, err := createTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		webhookCallCount++
-		mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		allWebhooksReceived.Done()
-	}))
-	is.NoErr(err)
+	server, err := createWebhookServerWithExpected(tdb.Is, false, false, 2)
+	tdb.Is.NoErr(err)
 	defer server.Close()
 
-	// Create trigger
-	reviewSubmissionUrl := server.URL
-	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
-		ReviewSubmissionURL: &reviewSubmissionUrl,
+	err = CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
+		ReviewSubmissionURL: &server.URL,
 	})
-	is.NoErr(err)
+	tdb.Is.NoErr(err)
 
-	// Insert duplicate audit events for same instanceId + reviewState
 	instanceId := "test-instance-789"
 	for i := 0; i < 3; i++ {
-		auditInsertSql := fmt.Sprintf(`
+		_, err = tdb.Conn.Exec(tdb.Ctx, fmt.Sprintf(`
 			INSERT INTO audits_test ("actorId", action, details)
 			VALUES (5, 'submission.update', '{"instanceId": "%s", "reviewState": "approved"}');
-		`, instanceId)
-		_, err = conn.Exec(ctx, auditInsertSql)
-		is.NoErr(err)
+		`, instanceId))
+		tdb.Is.NoErr(err)
 	}
 
-	// Give first webhook time to arrive
 	time.Sleep(1 * time.Second)
+	tdb.Is.Equal(server.GetCount(), 1)
 
-	mu.Lock()
-	firstCount := webhookCallCount
-	mu.Unlock()
-
-	// Should have received exactly 1 webhook for the 3 duplicate inserts
-	is.Equal(firstCount, 1)
-
-	// Now insert with different reviewState - should trigger another webhook
-	auditInsertSql := fmt.Sprintf(`
+	_, err = tdb.Conn.Exec(tdb.Ctx, fmt.Sprintf(`
 		INSERT INTO audits_test ("actorId", action, details)
 		VALUES (5, 'submission.update', '{"instanceId": "%s", "reviewState": "rejected"}');
-	`, instanceId)
-	_, err = conn.Exec(ctx, auditInsertSql)
-	is.NoErr(err)
+	`, instanceId))
+	tdb.Is.NoErr(err)
 
-	// Wait for both webhooks
-	done := make(chan struct{})
-	go func() {
-		allWebhooksReceived.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Expected - different reviewState should trigger new webhook
-	case <-time.After(5 * time.Second):
-		mu.Lock()
-		currentCount := webhookCallCount
-		mu.Unlock()
-		t.Fatalf("timeout waiting for second webhook request (received %d webhooks)", currentCount)
+	err = server.WaitForRequest(5 * time.Second)
+	if err != nil {
+		t.Fatalf("timeout waiting for second webhook request (received %d webhooks)", server.GetCount())
 	}
 
-	mu.Lock()
-	finalCount := webhookCallCount
-	mu.Unlock()
+	tdb.Is.Equal(server.GetCount(), 2)
 
-	// Should have 2 webhooks total (one per unique reviewState)
-	is.Equal(finalCount, 2)
-
-	// Cleanup
-	err = RemoveTrigger(ctx, pool, "audits_test")
-	is.NoErr(err)
-	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
 }
