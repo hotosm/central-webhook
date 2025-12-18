@@ -2,8 +2,11 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -41,25 +44,41 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		url := quoteSQLString(*opts.UpdateEntityURL)
 		caseStatements += fmt.Sprintf(`
 			WHEN 'entity.update.version' THEN
-				SELECT entity_defs."data"
-				INTO result_data
-				FROM entity_defs
-				WHERE entity_defs.id = (NEW.details->>'entityDefId')::int;
+			-- Deduplicate: only fire for the first audit row for this entity UUID
+			IF EXISTS (
+				SELECT 1
+				FROM %s a
+				WHERE a.action = 'entity.update.version'
+				AND a.details->'entity'->>'uuid' = NEW.details->'entity'->>'uuid'
+				AND a.details ? 'webhook_sent'
+			) THEN
+				-- Already processed this entity
+				NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+				RETURN NEW;
+			END IF;
 
-				webhook_payload := jsonb_build_object(
-					'type', 'entity.update.version',
-					'id', (NEW.details->'entity'->>'uuid'),
-					'data', result_data
-				);
+			SELECT entity_defs."data"
+			INTO result_data
+			FROM entity_defs
+			WHERE entity_defs.id = (NEW.details->>'entityDefId')::int;
 
-				PERFORM http((
-					'POST',
-					%s,
-					http_headers(%s),
-					'application/json',
-					webhook_payload::text
-				)::http_request);
-		`, url, headersSQL)
+			webhook_payload := jsonb_build_object(
+				'type', 'entity.update.version',
+				'id', (NEW.details->'entity'->>'uuid'),
+				'data', result_data
+			);
+
+			PERFORM http((
+				'POST',
+				%s,
+				http_headers(%s),
+				'application/json',
+				webhook_payload::text
+			)::http_request);
+
+			-- Mark as processed
+			NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+		`, tableName, url, headersSQL)
 	}
 
 	// ---------------------------------------------------------------------
@@ -69,25 +88,41 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		url := quoteSQLString(*opts.NewSubmissionURL)
 		caseStatements += fmt.Sprintf(`
 			WHEN 'submission.create' THEN
-				SELECT jsonb_build_object('xml', submission_defs.xml)
-				INTO result_data
-				FROM submission_defs
-				WHERE submission_defs.id = (NEW.details->>'submissionDefId')::int;
+			-- Deduplicate by instanceId
+			IF EXISTS (
+				SELECT 1
+				FROM %s a
+				WHERE a.action = 'submission.create'
+				AND a.details->>'instanceId' = NEW.details->>'instanceId'
+				AND a.details ? 'webhook_sent'
+			) THEN
+				-- Already processed
+				NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+				RETURN NEW;
+			END IF;
 
-				webhook_payload := jsonb_build_object(
-					'type', 'submission.create',
-					'id', (NEW.details->>'instanceId'),
-					'data', result_data
-				);
+			SELECT jsonb_build_object('xml', submission_defs.xml)
+			INTO result_data
+			FROM submission_defs
+			WHERE submission_defs.id = (NEW.details->>'submissionDefId')::int;
 
-				PERFORM http((
-					'POST',
-					%s,
-					http_headers(%s),
-					'application/json',
-					webhook_payload::text
-				)::http_request);
-		`, url, headersSQL)
+			webhook_payload := jsonb_build_object(
+				'type', 'submission.create',
+				'id', (NEW.details->>'instanceId'),
+				'data', result_data
+			);
+
+			PERFORM http((
+				'POST',
+				%s,
+				http_headers(%s),
+				'application/json',
+				webhook_payload::text
+			)::http_request);
+
+			-- Mark as processed
+			NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+		`, tableName, url, headersSQL)
 	}
 
 	// ---------------------------------------------------------------------
@@ -97,22 +132,39 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		url := quoteSQLString(*opts.ReviewSubmissionURL)
 		caseStatements += fmt.Sprintf(`
 			WHEN 'submission.update' THEN
-				webhook_payload := jsonb_build_object(
-					'type', 'submission.update',
-					'id', (NEW.details->>'instanceId'),
-					'data', jsonb_build_object(
-						'reviewState', NEW.details->>'reviewState'
-					)
-				);
+			-- Deduplicate by instanceId + reviewState
+			IF EXISTS (
+				SELECT 1
+				FROM %s a
+				WHERE a.action = 'submission.update'
+				AND a.details->>'instanceId' = NEW.details->>'instanceId'
+				AND a.details->>'reviewState' = NEW.details->>'reviewState'
+				AND a.details ? 'webhook_sent'
+			) THEN
+				-- Already processed
+				NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+				RETURN NEW;
+			END IF;
 
-				PERFORM http((
-					'POST',
-					%s,
-					http_headers(%s),
-					'application/json',
-					webhook_payload::text
-				)::http_request);
-		`, url, headersSQL)
+			webhook_payload := jsonb_build_object(
+				'type', 'submission.update',
+				'id', (NEW.details->>'instanceId'),
+				'data', jsonb_build_object(
+					'reviewState', NEW.details->>'reviewState'
+				)
+			);
+
+			PERFORM http((
+				'POST',
+				%s,
+				http_headers(%s),
+				'application/json',
+				webhook_payload::text
+			)::http_request);
+
+			-- Mark as processed
+			NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+		`, tableName, url, headersSQL)
 	}
 
 	// Default case
@@ -131,17 +183,9 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		BEGIN
 			action_type := NEW.action;
 
-			-- Prevent duplicate webhooks
-			-- see https://github.com/hotosm/central-webhook/issues/7
-			IF
-				(action_type = 'submission.create' AND TG_OP != 'INSERT')
-				OR
-				(action_type IN ('entity.update.version', 'submission.update') AND TG_OP NOT IN ('INSERT', 'UPDATE'))
-			THEN
-				RETURN NEW;
-			END IF;
-
 			CASE action_type
+
+			-- Here we insert the audit event type triggers from above
 			%s
 			END CASE;
 
@@ -161,7 +205,7 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 
 	createTriggerSQL := fmt.Sprintf(`
 		CREATE TRIGGER new_audit_log_trigger
-			AFTER INSERT OR UPDATE ON %s
+			BEFORE INSERT ON %s
 			FOR EACH ROW
 			EXECUTE FUNCTION new_audit_log();
 	`, tableName)
@@ -194,6 +238,27 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 	return nil
 }
 
+// Returns true if the error indicates the object was already
+// dropped or doesn't exist, which is fine when using DROP IF EXISTS
+func isAcceptableDropError(err error, acceptableCodes ...string) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+
+	// XX000 = tuple concurrently updated (happens with parallel drops)
+	// 42704 = object does not exist (trigger/table)
+	// 42883 = function does not exist
+	codes := append([]string{"XX000", "42704", "42883"}, acceptableCodes...)
+	for _, code := range codes {
+		if pgErr.Code == code {
+			return true
+		}
+	}
+
+	return strings.Contains(pgErr.Message, "does not exist")
+}
+
 // RemoveTrigger removes the webhook trigger from the database
 func RemoveTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string) error {
 	if tableName == "" {
@@ -206,8 +271,6 @@ func RemoveTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string) 
 	}
 	defer conn.Release()
 
-	// Check if table exists (optional check - we use IF EXISTS so it's not required)
-	// But it's helpful to provide a clear error if the table doesn't exist
 	tableExists, err := checkTableExists(ctx, conn, tableName)
 	if err != nil {
 		return fmt.Errorf("failed to check if table exists: %w", err)
@@ -216,23 +279,18 @@ func RemoveTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string) 
 		return fmt.Errorf("table %q does not exist. Please verify you are connecting to the correct database", tableName)
 	}
 
-	// First, drop the trigger (if it exists)
-	dropTriggerSQL := fmt.Sprintf(`
-		DROP TRIGGER IF EXISTS new_audit_log_trigger
-		ON %s CASCADE;
-	`, tableName)
-
+	dropTriggerSQL := fmt.Sprintf(`DROP TRIGGER IF EXISTS new_audit_log_trigger ON %s CASCADE;`, tableName)
 	if _, err := conn.Exec(ctx, dropTriggerSQL); err != nil {
-		return fmt.Errorf("failed to drop trigger: %w", err)
+		if !isAcceptableDropError(err) {
+			return fmt.Errorf("failed to drop trigger: %w", err)
+		}
 	}
 
-	// Then drop the function with CASCADE to handle any remaining dependencies
-	dropFunctionSQL := `
-		DROP FUNCTION IF EXISTS new_audit_log() CASCADE;
-	`
-
+	dropFunctionSQL := `DROP FUNCTION IF EXISTS new_audit_log() CASCADE;`
 	if _, err := conn.Exec(ctx, dropFunctionSQL); err != nil {
-		return fmt.Errorf("failed to drop function: %w", err)
+		if !isAcceptableDropError(err) {
+			return fmt.Errorf("failed to drop function: %w", err)
+		}
 	}
 
 	return nil

@@ -76,6 +76,7 @@ func createAuditTestsTable(ctx context.Context, conn *pgxpool.Conn, is *is.I) {
 	is.NoErr(err)
 	auditTableCreateSql := `
 		CREATE TABLE audits_test (
+			id SERIAL PRIMARY KEY,
 			"actorId" int,
 			action varchar,
 			details jsonb
@@ -190,6 +191,7 @@ func TestNewSubmissionTrigger(t *testing.T) {
 	conn, err := pool.Acquire(ctx)
 	is.NoErr(err)
 	defer conn.Release()
+	_, _ = conn.Exec(ctx, `DROP FUNCTION IF EXISTS new_audit_log() CASCADE;`)
 
 	// Create submission_defs table
 	createSubmissionDefsTable(ctx, conn, is)
@@ -698,4 +700,310 @@ func TestTriggerWithAPIKey(t *testing.T) {
 	err = RemoveTrigger(ctx, pool, "audits_test")
 	is.NoErr(err)
 	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs, audits_test CASCADE;`)
+}
+
+// Verifies only one webhook is sent for duplicate entity updates
+func TestDeduplicationEntityUpdate(t *testing.T) {
+	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
+	if len(dbUri) == 0 {
+		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
+	}
+
+	is := is.New(t)
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	ctx := context.Background()
+	pool, err := InitPool(ctx, log, dbUri)
+	is.NoErr(err)
+	defer pool.Close()
+
+	conn, err := pool.Acquire(ctx)
+	is.NoErr(err)
+	defer conn.Release()
+
+	// Create entity_defs table
+	_, err = conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs CASCADE;`)
+	is.NoErr(err)
+	entityTableCreateSql := `
+		CREATE TABLE entity_defs (
+			id int4,
+			"entityId" int4,
+			"data" jsonb
+		);
+	`
+	_, err = conn.Exec(ctx, entityTableCreateSql)
+	is.NoErr(err)
+
+	// Insert entity record
+	entityInsertSql := `
+		INSERT INTO entity_defs (id, "entityId", "data")
+		VALUES (1001, 900, '{"status": "active"}');
+	`
+	_, err = conn.Exec(ctx, entityInsertSql)
+	is.NoErr(err)
+
+	// Create audits_test table
+	createAuditTestsTable(ctx, conn, is)
+
+	// Track webhook calls
+	var webhookCallCount int
+	var mu sync.Mutex
+	var requestReceived sync.WaitGroup
+	requestReceived.Add(1) // Expect only 1 call
+
+	server, err := createTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		webhookCallCount++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		if webhookCallCount == 1 {
+			requestReceived.Done()
+		}
+	}))
+	is.NoErr(err)
+	defer server.Close()
+
+	// Create trigger
+	updateEntityUrl := server.URL
+	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+		UpdateEntityURL: &updateEntityUrl,
+	})
+	is.NoErr(err)
+
+	// Insert the same audit event 3 times (simulating duplicate events)
+	for i := 0; i < 3; i++ {
+		auditInsertSql := `
+			INSERT INTO audits_test ("actorId", action, details)
+			VALUES (1, 'entity.update.version', '{"entityDefId": 1001, "entity": {"uuid": "test-uuid-123"}}');
+		`
+		_, err = conn.Exec(ctx, auditInsertSql)
+		is.NoErr(err)
+	}
+
+	// Wait for webhook(s)
+	done := make(chan struct{})
+	go func() {
+		requestReceived.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected - got first webhook
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for webhook request")
+	}
+
+	// Wait a bit more to ensure no additional webhooks arrive
+	time.Sleep(2 * time.Second)
+
+	mu.Lock()
+	finalCount := webhookCallCount
+	mu.Unlock()
+
+	// Should only have received 1 webhook despite 3 audit inserts
+	is.Equal(finalCount, 1)
+
+	// Cleanup
+	err = RemoveTrigger(ctx, pool, "audits_test")
+	is.NoErr(err)
+	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs, audits_test CASCADE;`)
+}
+
+// Verifies only one webhook for duplicate submission creates
+func TestDeduplicationSubmissionCreate(t *testing.T) {
+	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
+	if len(dbUri) == 0 {
+		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
+	}
+
+	is := is.New(t)
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	ctx := context.Background()
+	pool, err := InitPool(ctx, log, dbUri)
+	is.NoErr(err)
+	defer pool.Close()
+
+	conn, err := pool.Acquire(ctx)
+	is.NoErr(err)
+	defer conn.Release()
+
+	// Create tables
+	createSubmissionDefsTable(ctx, conn, is)
+	createAuditTestsTable(ctx, conn, is)
+
+	// Insert submission record
+	submissionInsertSql := `
+		INSERT INTO submission_defs (id, "submissionId", xml)
+		VALUES (1, 2, '<data id="test"/>');
+	`
+	_, err = conn.Exec(ctx, submissionInsertSql)
+	is.NoErr(err)
+
+	// Track webhook calls
+	var webhookCallCount int
+	var mu sync.Mutex
+	var requestReceived sync.WaitGroup
+	requestReceived.Add(1)
+
+	server, err := createTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		webhookCallCount++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		if webhookCallCount == 1 {
+			requestReceived.Done()
+		}
+	}))
+	is.NoErr(err)
+	defer server.Close()
+
+	// Create trigger
+	newSubmissionUrl := server.URL
+	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+		NewSubmissionURL: &newSubmissionUrl,
+	})
+	is.NoErr(err)
+
+	// Insert duplicate audit events for the same instanceId
+	instanceId := "dup-test-instance-456"
+	for i := 0; i < 3; i++ {
+		auditInsertSql := fmt.Sprintf(`
+			INSERT INTO audits_test ("actorId", action, details)
+			VALUES (5, 'submission.create', '{"submissionDefId": 1, "instanceId": "%s"}');
+		`, instanceId)
+		_, err = conn.Exec(ctx, auditInsertSql)
+		is.NoErr(err)
+	}
+
+	// Wait for first webhook
+	done := make(chan struct{})
+	go func() {
+		requestReceived.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for webhook request")
+	}
+
+	// Wait to ensure no additional webhooks
+	time.Sleep(2 * time.Second)
+
+	mu.Lock()
+	finalCount := webhookCallCount
+	mu.Unlock()
+
+	is.Equal(finalCount, 1)
+
+	// Cleanup
+	err = RemoveTrigger(ctx, pool, "audits_test")
+	is.NoErr(err)
+	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
+}
+
+// Verify only one webhook per reviewState transition
+func TestDeduplicationSubmissionUpdate(t *testing.T) {
+	dbUri := os.Getenv("CENTRAL_WEBHOOK_DB_URI")
+	if len(dbUri) == 0 {
+		dbUri = "postgresql://odk:odk@db:5432/odk?sslmode=disable"
+	}
+
+	is := is.New(t)
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	ctx := context.Background()
+	pool, err := InitPool(ctx, log, dbUri)
+	is.NoErr(err)
+	defer pool.Close()
+
+	conn, err := pool.Acquire(ctx)
+	is.NoErr(err)
+	defer conn.Release()
+
+	// Create tables
+	createSubmissionDefsTable(ctx, conn, is)
+	createAuditTestsTable(ctx, conn, is)
+
+	// Track webhook calls - need to expect 2 total
+	var webhookCallCount int
+	var mu sync.Mutex
+	var allWebhooksReceived sync.WaitGroup
+	allWebhooksReceived.Add(2) // Expect 2 webhooks total
+
+	server, err := createTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		webhookCallCount++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		allWebhooksReceived.Done()
+	}))
+	is.NoErr(err)
+	defer server.Close()
+
+	// Create trigger
+	reviewSubmissionUrl := server.URL
+	err = CreateTrigger(ctx, pool, "audits_test", TriggerOptions{
+		ReviewSubmissionURL: &reviewSubmissionUrl,
+	})
+	is.NoErr(err)
+
+	// Insert duplicate audit events for same instanceId + reviewState
+	instanceId := "test-instance-789"
+	for i := 0; i < 3; i++ {
+		auditInsertSql := fmt.Sprintf(`
+			INSERT INTO audits_test ("actorId", action, details)
+			VALUES (5, 'submission.update', '{"instanceId": "%s", "reviewState": "approved"}');
+		`, instanceId)
+		_, err = conn.Exec(ctx, auditInsertSql)
+		is.NoErr(err)
+	}
+
+	// Give first webhook time to arrive
+	time.Sleep(1 * time.Second)
+
+	mu.Lock()
+	firstCount := webhookCallCount
+	mu.Unlock()
+
+	// Should have received exactly 1 webhook for the 3 duplicate inserts
+	is.Equal(firstCount, 1)
+
+	// Now insert with different reviewState - should trigger another webhook
+	auditInsertSql := fmt.Sprintf(`
+		INSERT INTO audits_test ("actorId", action, details)
+		VALUES (5, 'submission.update', '{"instanceId": "%s", "reviewState": "rejected"}');
+	`, instanceId)
+	_, err = conn.Exec(ctx, auditInsertSql)
+	is.NoErr(err)
+
+	// Wait for both webhooks
+	done := make(chan struct{})
+	go func() {
+		allWebhooksReceived.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected - different reviewState should trigger new webhook
+	case <-time.After(5 * time.Second):
+		mu.Lock()
+		currentCount := webhookCallCount
+		mu.Unlock()
+		t.Fatalf("timeout waiting for second webhook request (received %d webhooks)", currentCount)
+	}
+
+	mu.Lock()
+	finalCount := webhookCallCount
+	mu.Unlock()
+
+	// Should have 2 webhooks total (one per unique reviewState)
+	is.Equal(finalCount, 2)
+
+	// Cleanup
+	err = RemoveTrigger(ctx, pool, "audits_test")
+	is.NoErr(err)
+	_, _ = conn.Exec(ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
 }
