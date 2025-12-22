@@ -3,6 +3,20 @@
 #   docker compose -f docker-compose.yml -f /path/to/this/repo/compose.webhook.yml up -d
 
 services:
+  # Add a healthcheck to the Central API service
+  service:
+    healthcheck:
+      test: nc -z localhost 8383 || exit 1
+      start_period: 15s
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Override the image used to contain the `pgsql-http` extension
+  postgres14:
+    image: "ghcr.io/hotosm/postgres:14-http"
+
+  # The main webhook service
   webhook:
     image: "ghcr.io/hotosm/central-webhook:0.2.0"
     environment:
@@ -15,7 +29,6 @@ services:
     depends_on:
       postgres14:
         condition: service_started
+      service:
+        condition: service_started
     restart: always
-
-  postgres14:
-    image: "ghcr.io/hotosm/postgres:14-http"
