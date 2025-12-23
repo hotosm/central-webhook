@@ -12,13 +12,20 @@ services:
       timeout: 5s
       retries: 10
 
-  # Override the image used to contain the `pgsql-http` extension
+  # Override the image used to contain the `pgsql-http` extension and a healthcheck
   postgres14:
     image: "ghcr.io/hotosm/postgres:14-http"
 
+    healthcheck:
+      test: pg_isready -U ${DB_USER:-odk} || exit 1
+      start_period: 10s
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   # The main webhook service
   webhook:
-    image: "ghcr.io/hotosm/central-webhook:0.2.0"
+    image: "ghcr.io/hotosm/central-webhook:1.0.2"
     environment:
       CENTRAL_WEBHOOK_DB_URI: postgresql://odk:odk@postgres14:5432/odk?sslmode=disable
       CENTRAL_WEBHOOK_UPDATE_ENTITY_URL: ${CENTRAL_WEBHOOK_UPDATE_ENTITY_URL}
@@ -26,9 +33,10 @@ services:
       CENTRAL_WEBHOOK_NEW_SUBMISSION_URL: ${CENTRAL_WEBHOOK_NEW_SUBMISSION_URL}
       CENTRAL_WEBHOOK_API_KEY: ${CENTRAL_WEBHOOK_API_KEY}
       CENTRAL_WEBHOOK_LOG_LEVEL: ${CENTRAL_WEBHOOK_LOG_LEVEL:-INFO}
+    # It waits for everything to be ready to install the trigger
     depends_on:
       postgres14:
-        condition: service_started
+        condition: service_healthy
       service:
-        condition: service_started
-    restart: always
+        condition: service_healthy
+    restart: on-failure

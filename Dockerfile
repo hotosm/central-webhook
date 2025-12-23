@@ -39,4 +39,4 @@ COPY --from=useradd /etc/group /etc/group
 COPY --from=useradd /etc/passwd /etc/passwd
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 USER nonroot:nonroot
-ENTRYPOINT ["/app/centralwebhook"]
+ENTRYPOINT ["/app/centralwebhook", "install"]
