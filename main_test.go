@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/hotosm/central-webhook/db"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/matryer/is"
 )
 
@@ -78,6 +78,9 @@ func getTestDBURI() string {
 }
 
 func setupTestTables(ctx context.Context, conn *pgxpool.Conn) error {
+	// Ensure no stale webhook artifacts from previous runs.
+	_, _ = conn.Exec(ctx, `DROP FUNCTION IF EXISTS new_audit_log() CASCADE;`)
+
 	// Create entity_defs table
 	_, err := conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs CASCADE;`)
 	if err != nil {
@@ -116,7 +119,10 @@ func setupTestTables(ctx context.Context, conn *pgxpool.Conn) error {
 }
 
 func cleanupTestTables(ctx context.Context, conn *pgxpool.Conn) error {
-	_, err := conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs, audits CASCADE;`)
+	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS entity_defs, audits CASCADE;`); err != nil {
+		return err
+	}
+	_, err := conn.Exec(ctx, `DROP FUNCTION IF EXISTS new_audit_log() CASCADE;`)
 	return err
 }
 
@@ -242,7 +248,7 @@ func TestUninstallCommand(t *testing.T) {
 	// Uninstall trigger
 	err = db.RemoveTrigger(ctx, pool, "audits")
 	is.NoErr(err)
-	
+
 	// Small delay to ensure cleanup completes
 	time.Sleep(100 * time.Millisecond)
 

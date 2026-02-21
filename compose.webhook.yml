@@ -14,7 +14,7 @@ services:
 
   # Override the image used to contain the `pgsql-http` extension and a healthcheck
   postgres14:
-    image: "ghcr.io/hotosm/postgres:14-http"
+    image: "ghcr.io/hotosm/postgres:${POSTGRES_MAJOR:-14}-http"
 
     healthcheck:
       test: pg_isready -U ${DB_USER:-odk} || exit 1
@@ -25,9 +25,9 @@ services:
 
   # The main webhook service
   webhook:
-    image: "ghcr.io/hotosm/central-webhook:1.0.2"
+    image: "ghcr.io/hotosm/central-webhook:${CENTRAL_WEBHOOK_TAG:-latest}"
     environment:
-      CENTRAL_WEBHOOK_DB_URI: postgresql://odk:odk@postgres14:5432/odk?sslmode=disable
+      CENTRAL_WEBHOOK_DB_URI: postgresql://${DB_USER:-odk}:${DB_PASSWORD:-odk}@postgres14:5432/${DB_NAME:-odk}?sslmode=disable
       CENTRAL_WEBHOOK_UPDATE_ENTITY_URL: ${CENTRAL_WEBHOOK_UPDATE_ENTITY_URL}
       CENTRAL_WEBHOOK_REVIEW_SUBMISSION_URL: ${CENTRAL_WEBHOOK_REVIEW_SUBMISSION_URL}
       CENTRAL_WEBHOOK_NEW_SUBMISSION_URL: ${CENTRAL_WEBHOOK_NEW_SUBMISSION_URL}

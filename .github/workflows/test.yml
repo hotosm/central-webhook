@@ -18,5 +18,3 @@ jobs:
       tag_override: ci
       compose_file: compose.yml
       compose_service: webhook
-      cache_extra_imgs: |
-        "docker.io/postgis/postgis:17-3.5-alpine"

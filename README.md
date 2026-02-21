@@ -37,11 +37,59 @@ The `centralwebhook` tool is a simple CLI that installs or uninstalls database t
 
 > [!NOTE]
 > **Using our helper images**: We provide PostgreSQL images with the `pgsql-http` extension pre-installed:
-> - `ghcr.io/hotosm/postgres:18-http` (based on vanilla PostgreSQL 18 images)
+> - `ghcr.io/hotosm/postgres:14-http` (recommended default for current ODK Central installs)
+> - `ghcr.io/hotosm/postgres:15-http`
+> - `ghcr.io/hotosm/postgres:16-http`
+> - `ghcr.io/hotosm/postgres:17-http`
+> - `ghcr.io/hotosm/postgres:18-http`
 >
 > These images are drop-in replacements for standard PostgreSQL images and simply add the extension.
 >
 > **Installing manually**: If you don't wish to use these images, you must install the `pgsql-http` extension yourself. The extension may require superuser privileges to install. If you cannot install it yourself, ask your database administrator.
+
+## ODK Central Quick Start (Recommended)
+
+For most users running a mostly-vanilla ODK Central setup, the easiest approach is to layer this repo's compose override on top of the official Central compose file.
+
+1. In your ODK Central repo/environment, copy the example file and set webhook variables:
+
+```bash
+cp /path/to/central-webhook/.env.example .env.webhook
+```
+
+Then merge the values you need into your Central `.env` (or export them in your shell):
+
+```dotenv
+# Required: provide at least one webhook URL
+CENTRAL_WEBHOOK_NEW_SUBMISSION_URL=https://your.domain/webhook/new-submission
+CENTRAL_WEBHOOK_REVIEW_SUBMISSION_URL=https://your.domain/webhook/review-submission
+CENTRAL_WEBHOOK_UPDATE_ENTITY_URL=https://your.domain/webhook/update-entity
+
+# Optional
+CENTRAL_WEBHOOK_API_KEY=your-secret-api-key
+CENTRAL_WEBHOOK_LOG_LEVEL=INFO
+
+# Optional image tags (defaults shown)
+CENTRAL_WEBHOOK_TAG=latest
+POSTGRES_MAJOR=14
+```
+
+2. Start Central + webhook trigger installer:
+
+```bash
+docker compose -f docker-compose.yml -f /path/to/central-webhook/compose.webhook.yml up -d
+```
+
+3. Verify installation:
+
+```bash
+docker compose logs webhook
+```
+
+You should see a successful `install` message after Central and PostgreSQL are healthy.
+
+> [!IMPORTANT]
+> Use the helper image major version that matches your Central database major version. Do not point a newer PostgreSQL container at an existing older data directory without a proper PostgreSQL upgrade process.
 
 ## Usage
 
@@ -232,6 +280,10 @@ The tool installs PostgreSQL triggers on the `audits` table that:
 4. Include the `X-API-Key` header if provided during installation
 
 The triggers run automatically after installation - no long-running service is needed.
+
+For `submission.update` events, if `instanceId` is missing from audit details in your
+Central version, the trigger resolves it from `submission_defs` using
+`submissionDefId`/`submissionId`.
 
 ## Development
 

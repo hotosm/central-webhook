@@ -44,10 +44,6 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		url := quoteSQLString(*opts.UpdateEntityURL)
 		caseStatements += fmt.Sprintf(`
 			WHEN 'entity.update.version' THEN
-			DECLARE
-				entity_data jsonb;
-				entity_payload jsonb;
-			BEGIN
 				-- Deduplicate: only fire for the first audit row for this entity UUID
 				IF EXISTS (
 					SELECT 1
@@ -78,17 +74,16 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 					'data', entity_data
 				);
 
-				PERFORM http((
+				PERFORM (http((
 					'POST',
 					%s,
 					http_headers(%s),
 					'application/json',
 					entity_payload::text
-				)::http_request);
+				)::http_request)).status;
 
 				-- Mark as processed
 				NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
-			END;
 		`, tableName, url, headersSQL)
 	}
 
@@ -99,16 +94,33 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		url := quoteSQLString(*opts.NewSubmissionURL)
 		caseStatements += fmt.Sprintf(`
 			WHEN 'submission.create' THEN
-			DECLARE
-				submission_data jsonb;
-				submission_payload jsonb;
-			BEGIN
+				resolved_instance_id := NEW.details->>'instanceId';
+				IF (resolved_instance_id IS NULL OR resolved_instance_id = '')
+					AND (NEW.details->>'submissionDefId') IS NOT NULL THEN
+					SELECT submission_defs."instanceId"::text
+					INTO resolved_instance_id
+					FROM submission_defs
+					WHERE submission_defs.id = (NEW.details->>'submissionDefId')::int;
+				END IF;
+
+				IF resolved_instance_id IS NULL OR resolved_instance_id = '' THEN
+					RAISE WARNING 'Instance ID missing for submission.create event';
+					NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+					RETURN NEW;
+				END IF;
+
 				-- Deduplicate by instanceId
 				IF EXISTS (
 					SELECT 1
 					FROM %s a
 					WHERE a.action = 'submission.create'
-					AND a.details->>'instanceId' = NEW.details->>'instanceId'
+					AND (
+						a.details->>'instanceId' = resolved_instance_id
+						OR (
+							(NEW.details->>'submissionDefId') IS NOT NULL
+							AND a.details->>'submissionDefId' = NEW.details->>'submissionDefId'
+						)
+					)
 					AND a.details ? 'webhook_sent'
 				) THEN
 					-- Already processed
@@ -129,21 +141,20 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 
 				submission_payload := jsonb_build_object(
 					'type', 'submission.create',
-					'id', (NEW.details->>'instanceId'),
+					'id', resolved_instance_id,
 					'data', submission_data
 				);
 
-				PERFORM http((
+				PERFORM (http((
 					'POST',
 					%s,
 					http_headers(%s),
 					'application/json',
 					submission_payload::text
-				)::http_request);
+				)::http_request)).status;
 
 				-- Mark as processed
 				NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
-			END;
 		`, tableName, url, headersSQL)
 	}
 
@@ -154,16 +165,50 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		url := quoteSQLString(*opts.ReviewSubmissionURL)
 		caseStatements += fmt.Sprintf(`
 			WHEN 'submission.update' THEN
-			DECLARE
-				review_payload jsonb;
-			BEGIN
+				resolved_instance_id := NEW.details->>'instanceId';
+				resolved_review_state := COALESCE(NEW.details->>'reviewState', '');
+
+				-- Fallback for Central audit rows that omit instanceId
+				IF (resolved_instance_id IS NULL OR resolved_instance_id = '')
+					AND (NEW.details->>'submissionDefId') IS NOT NULL THEN
+					SELECT submission_defs."instanceId"::text
+					INTO resolved_instance_id
+					FROM submission_defs
+					WHERE submission_defs.id = (NEW.details->>'submissionDefId')::int;
+				END IF;
+				IF (resolved_instance_id IS NULL OR resolved_instance_id = '')
+					AND (NEW.details->>'submissionId') IS NOT NULL THEN
+					SELECT submission_defs."instanceId"::text
+					INTO resolved_instance_id
+					FROM submission_defs
+					WHERE submission_defs."submissionId" = (NEW.details->>'submissionId')::int
+					ORDER BY submission_defs.id DESC
+					LIMIT 1;
+				END IF;
+
+				IF resolved_instance_id IS NULL OR resolved_instance_id = '' THEN
+					RAISE WARNING 'Instance ID missing for submission.update event';
+					NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
+					RETURN NEW;
+				END IF;
+
 				-- Deduplicate by instanceId + reviewState
 				IF EXISTS (
 					SELECT 1
 					FROM %s a
 					WHERE a.action = 'submission.update'
-					AND a.details->>'instanceId' = NEW.details->>'instanceId'
-					AND a.details->>'reviewState' = NEW.details->>'reviewState'
+					AND (
+						a.details->>'instanceId' = resolved_instance_id
+						OR (
+							(NEW.details->>'submissionDefId') IS NOT NULL
+							AND a.details->>'submissionDefId' = NEW.details->>'submissionDefId'
+						)
+						OR (
+							(NEW.details->>'submissionId') IS NOT NULL
+							AND a.details->>'submissionId' = NEW.details->>'submissionId'
+						)
+					)
+					AND COALESCE(a.details->>'reviewState', '') = resolved_review_state
 					AND a.details ? 'webhook_sent'
 				) THEN
 					-- Already processed
@@ -173,23 +218,22 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 
 				review_payload := jsonb_build_object(
 					'type', 'submission.update',
-					'id', (NEW.details->>'instanceId'),
+					'id', resolved_instance_id,
 					'data', jsonb_build_object(
 						'reviewState', NEW.details->>'reviewState'
 					)
 				);
 
-				PERFORM http((
+				PERFORM (http((
 					'POST',
 					%s,
 					http_headers(%s),
 					'application/json',
 					review_payload::text
-				)::http_request);
+				)::http_request)).status;
 
 				-- Mark as processed
 				NEW.details := NEW.details || '{"webhook_sent": true}'::jsonb;
-			END;
 		`, tableName, url, headersSQL)
 	}
 
@@ -204,6 +248,13 @@ func CreateTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string, 
 		$$
 		DECLARE
 			action_type text;
+			entity_data jsonb;
+			entity_payload jsonb;
+			submission_data jsonb;
+			submission_payload jsonb;
+			review_payload jsonb;
+			resolved_instance_id text;
+			resolved_review_state text;
 		BEGIN
 			action_type := NEW.action;
 
@@ -356,6 +407,16 @@ func RemoveTrigger(ctx context.Context, dbPool *pgxpool.Pool, tableName string) 
 		if !isAcceptableDropError(err) {
 			return fmt.Errorf("failed to drop function: %w", err)
 		}
+	}
+
+	// Verify function removal. This catches rare cases where a DROP is accepted
+	// due to a transient error but the function still exists.
+	functionExists, err := checkFunctionExists(ctx, conn)
+	if err != nil {
+		return fmt.Errorf("failed to verify function removal: %w", err)
+	}
+	if functionExists {
+		return fmt.Errorf("failed to remove function new_audit_log")
 	}
 
 	return nil

@@ -52,7 +52,6 @@ func createTestServer(handler http.Handler) (*testServer, error) {
 
 	url := fmt.Sprintf("http://%s:%d", hostname, port)
 
-
 	ts := &testServer{
 		server:   server,
 		listener: listener,
@@ -123,12 +122,12 @@ func createEntityDefsTable(ctx context.Context, conn *pgxpool.Conn, is *is.I) {
 }
 
 type testDB struct {
-	URI    string
-	Pool   *pgxpool.Pool
-	Conn   *pgxpool.Conn
-	Log    *slog.Logger
-	Ctx    context.Context
-	Is     *is.I
+	URI  string
+	Pool *pgxpool.Pool
+	Conn *pgxpool.Conn
+	Log  *slog.Logger
+	Ctx  context.Context
+	Is   *is.I
 }
 
 func setupTestDB(t *testing.T) *testDB {
@@ -172,7 +171,6 @@ func getFunctionSQL(ctx context.Context, conn *pgxpool.Conn) (string, error) {
 	err := row.Scan(&functionSQL)
 	return functionSQL, err
 }
-
 
 type webhookServer struct {
 	*testServer
@@ -376,6 +374,53 @@ func TestReviewSubmissionTrigger(t *testing.T) {
 	tdb.Is.True(payload != nil)
 	tdb.Is.Equal(payload["type"], "submission.update")
 	tdb.Is.Equal(payload["id"], "33448049-0df1-4426-9392-d3a294d638ad")
+
+	data, ok := payload["data"].(map[string]interface{})
+	tdb.Is.True(ok)
+	tdb.Is.Equal(data["reviewState"], "approved")
+
+	err = RemoveTrigger(tdb.Ctx, tdb.Pool, "audits_test")
+	tdb.Is.NoErr(err)
+	_, _ = tdb.Conn.Exec(tdb.Ctx, `DROP TABLE IF EXISTS submission_defs, audits_test CASCADE;`)
+}
+
+func TestReviewSubmissionTriggerResolvesMissingInstanceID(t *testing.T) {
+	tdb := setupTestDB(t)
+	defer tdb.Close()
+
+	createSubmissionDefsTable(tdb.Ctx, tdb.Conn, tdb.Is)
+	createAuditTestsTable(tdb.Ctx, tdb.Conn, tdb.Is)
+
+	_, err := tdb.Conn.Exec(tdb.Ctx, `
+		INSERT INTO submission_defs (id, "submissionId", "instanceId")
+		VALUES (10, 999, '11111111-2222-3333-4444-555555555555');
+	`)
+	tdb.Is.NoErr(err)
+
+	server, err := createWebhookServer(tdb.Is, true, false)
+	tdb.Is.NoErr(err)
+	defer server.Close()
+
+	err = CreateTrigger(tdb.Ctx, tdb.Pool, "audits_test", TriggerOptions{
+		ReviewSubmissionURL: &server.URL,
+	})
+	tdb.Is.NoErr(err)
+
+	_, err = tdb.Conn.Exec(tdb.Ctx, `
+		INSERT INTO audits_test ("actorId", action, details)
+		VALUES (5, 'submission.update', '{"submissionDefId": 10, "reviewState": "approved"}');
+	`)
+	tdb.Is.NoErr(err)
+
+	err = server.WaitForRequest(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := server.Payload()
+	tdb.Is.True(payload != nil)
+	tdb.Is.Equal(payload["type"], "submission.update")
+	tdb.Is.Equal(payload["id"], "11111111-2222-3333-4444-555555555555")
 
 	data, ok := payload["data"].(map[string]interface{})
 	tdb.Is.True(ok)

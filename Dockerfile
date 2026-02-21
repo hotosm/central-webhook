@@ -12,7 +12,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /app/centralwebhook
 
 # Run the tests in the container
 FROM build AS run-test-stage
-RUN go test -v ./...
+RUN go test -p 1 -v ./...
 
 
 # Add a non-root user to passwd file
