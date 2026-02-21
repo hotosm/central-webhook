@@ -32,3 +32,6 @@ FROM postgres:18 AS pg-18
 RUN apt-get update \
     && apt-get install -y postgresql-18-http \
     && rm -rf /var/lib/apt/lists/*
+
+# TEMP WORKAROUND: https://github.com/docker-library/postgres/issues/1324
+RUN rm -rf /usr/local/bin/gosu
