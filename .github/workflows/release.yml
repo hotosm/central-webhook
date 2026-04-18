@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   container-img:
-    uses: hotosm/gh-workflows/.github/workflows/image_build.yml@2.0.5
+    uses: hotosm/gh-workflows/.github/workflows/image_build.yml@3.6.0
     with:
       build_target: release
       image_name: "ghcr.io/${{ github.repository }}"

@@ -17,7 +17,7 @@ jobs:
     strategy:
       matrix:
         pg_version: [14, 15, 16, 17, 18]
-    uses: hotosm/gh-workflows/.github/workflows/image_build.yml@2.0.5
+    uses: hotosm/gh-workflows/.github/workflows/image_build.yml@3.6.0
     with:
       build_target: pg-${{ matrix.pg_version }}
       image_tags: |
